@@ -158,6 +158,26 @@ class CausalSelfAttention(nn.Module):
         return y
 
 
+def _can_fuse_nvfp4_operand(x, linear):
+    """Leave unsupported/dynamic activation shapes on the original math path.
+
+    The cooperative SM121 quantizer requires contiguous 2D BF16 operands with
+    both logical dimensions divisible by 128. Its wrappers make the contiguous
+    view, so no input-stride check is needed here. Do not route plain Linears,
+    biased projections or sharded NVFP4 modules into the fused custom op.
+    """
+    return (
+        x.dtype == torch.bfloat16
+        and x.is_cuda
+        and x.shape[-1] % 128 == 0
+        and (x.numel() // x.shape[-1]) % 128 == 0
+        and getattr(linear, "in_features", 0) % 128 == 0
+        and getattr(linear, "out_features", 0) % 128 == 0
+        and getattr(linear, "bias", None) is None
+        and getattr(linear, "process_group", object()) is None
+    )
+
+
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -167,7 +187,7 @@ class MLP(nn.Module):
     def forward(self, x):
         x = self.c_fc(x)
         if (os.environ.get("NANOCHAT_NVFP4_FUSED_MLP", "0") == "1"
-                and getattr(self.c_proj, "process_group", object()) is None):
+                and _can_fuse_nvfp4_operand(x, self.c_proj)):
             from nanochat.kernels.fused_mlp import fused_relu2_linear
             return fused_relu2_linear(x, self.c_proj)
         return self.c_proj(F.relu(x).square())
@@ -177,7 +197,7 @@ class MLP(nn.Module):
         from nanochat.kernels.fused_rmsnorm import fused_norm_linear
         h = fused_norm_linear(x, self.c_fc)
         if (os.environ.get("NANOCHAT_NVFP4_FUSED_MLP", "0") == "1"
-                and getattr(self.c_proj, "process_group", object()) is None):
+                and _can_fuse_nvfp4_operand(x, self.c_proj)):
             from nanochat.kernels.fused_mlp import fused_relu2_linear
             return fused_relu2_linear(h, self.c_proj)
         return self.c_proj(F.relu(h).square())
@@ -192,8 +212,7 @@ class Block(nn.Module):
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
         if (os.environ.get("NANOCHAT_NVFP4_FUSED_RMSNORM", "0") == "1"
-                and x.dtype == torch.bfloat16
-                and getattr(self.mlp.c_fc, "process_group", object()) is None):
+                and _can_fuse_nvfp4_operand(x, self.mlp.c_fc)):
             x = x + self.mlp.forward_fused_norm(x)
         else:
             x = x + self.mlp(norm(x))
