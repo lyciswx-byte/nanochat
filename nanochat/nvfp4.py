@@ -320,7 +320,7 @@ def _install_fused_activation_quantizer() -> None:
         return
 
     @torch._dynamo.allow_in_graph
-class _FusedNvfp4Matmul(torch.autograd.Function):
+    class _FusedNvfp4Matmul(torch.autograd.Function):
         @staticmethod
         def forward(
             ctx, input_hp, weight_hp, bias, sr_seed, sign_vector,
