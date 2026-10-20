@@ -145,7 +145,9 @@ quant_coop(const __nv_bfloat16 *__restrict__ x, int M, int N,
     if (candidate == 0.0f) candidate = 1.0f;
     float global_encode = amax == 0.0f ? 1.0f : candidate;
     float global_decode = __fdiv_rn(1.0f, global_encode);
-    float scale_ratio = global_encode * (1.0f / 6.0f);
+    // The reference first scales BF16 block values with the tensor-wide
+    // encode factor, then divides their maximum by FP4_MAX (6). Combining
+    // these factors changes FP32 rounding at E4M3 halfway boundaries.
 
     int tiles_n = N / TN;
     int ntiles = (M / TM) * tiles_n;
@@ -190,10 +192,19 @@ quant_coop(const __nv_bfloat16 *__restrict__ x, int M, int N,
             unsigned int sf = 0;
             float enc = 0.0f;
             if (lane == 0) {
-                float pvscale = fminf(vmax * scale_ratio, 448.0f);
-                sf = __nv_cvt_float_to_fp8(pvscale, __NV_SATFINITE, __NV_E4M3);
-                float denom = fp8_decode(uint8_t(sf)) * global_decode;
-                enc = fminf(__fdiv_rn(1.0f, denom), FLT_MAX);
+                if (vmax == 0.0f) {
+                    // torchao writes the E4M3 +0 byte, NOT the smallest
+                    // normal/subnormal block scale, for an all-zero 16x16.
+                    // Explicitly avoid 1 / (0 * global_decode) as well.
+                    sf = 0;
+                    enc = 0.0f;
+                } else {
+                    float scaled_max = vmax * global_encode;
+                    float pvscale = fminf(__fdiv_rn(scaled_max, 6.0f), 448.0f);
+                    sf = __nv_cvt_float_to_fp8(pvscale, __NV_SATFINITE, __NV_E4M3);
+                    float denom = fp8_decode(uint8_t(sf)) * global_decode;
+                    enc = fminf(__fdiv_rn(1.0f, denom), FLT_MAX);
+                }
             }
             sf = __shfl_sync(0xffffffff, sf, 0);
             enc = __shfl_sync(0xffffffff, enc, 0);
