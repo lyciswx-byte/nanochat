@@ -68,17 +68,20 @@ def correctness(shape=(128, 256), seed=20261020, compare_dequant=True):
         same = bool(torch.equal(a.view(torch.uint8) if a.dtype == torch.float8_e4m3fn else a,
                                 b.view(torch.uint8) if b.dtype == torch.float8_e4m3fn else b))
         issues[name] = {"bitwise_equal": same}
+    recon = {}
     if compare_dequant:
         for idx, label, source in ((0, "row", x), (2, "col", x.t())):
             dq_ref = dequant(ref[idx], ref[idx + 1], ref[4])
             dq_new = dequant(got[idx], got[idx + 1], got[4])
             err = (dq_ref - dq_new).abs()
             tol = (dq_ref - source.float()).abs()
-            issues[label]["max_reference_delta"] = float(err.max())
-            issues[label]["ref_mae_to_bf16"] = float(tol.mean())
-            issues[label]["new_mae_to_bf16"] = float((dq_new - source.float()).abs().mean())
+            recon[label] = {
+                "max_reference_delta": float(err.max()),
+                "ref_mae_to_bf16": float(tol.mean()),
+                "new_mae_to_bf16": float((dq_new - source.float()).abs().mean()),
+            }
     ok = all(v["bitwise_equal"] for v in issues.values())
-    return {"shape": shape, "pass": ok, "checks": issues}
+    return {"shape": shape, "pass": ok, "checks": issues, "reconstruction": recon}
 
 
 def time_it(fn, iters=10, warmup=3):
@@ -96,23 +99,69 @@ def time_it(fn, iters=10, warmup=3):
     return times[len(times) // 2]
 
 
-def measure(x, args):
+def _gemm_tflops(m, k, n, elapsed_ms):
+    """Actual GEMM FLOPs / measured CUDA-event milliseconds, in TFLOP/s."""
+    return 2 * m * k * n / (elapsed_ms * 1e9)
+
+
+def measure_gemm(x, output_features, args):
+    """Time only the native torchao NVFP4 GEMM on prequantized operands.
+
+    This is a separate measured operator, not a TFLOPS estimate attributed
+    to the quantizer. Both end-to-end rates below add its time to quant time.
+    """
+    import torchao.prototype.moe_training.nvfp4_training.nvfp4_linear as nv
+    m, k = x.shape
+    weight = torch.randn((output_features, k), device=x.device, dtype=x.dtype)
+    with torch.no_grad():
+        ar, asf, _, _, amax = fused_quantize(x)
+        wr, wsf, _, _, wamax = torchao_plain_reference(weight)
+        a = ar.view(torch.float4_e2m1fn_x2)
+        b = wr.view(torch.float4_e2m1fn_x2).t()
+        scale_a = [asf.flatten(), nv.per_tensor_amax_to_scale(amax)]
+        scale_b = [wsf.flatten(), nv.per_tensor_amax_to_scale(wamax)]
+        F = nv.F
+
+        def gemm():
+            return F.scaled_mm(
+                a, b,
+                scale_a=scale_a,
+                scale_recipe_a=[F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
+                scale_b=scale_b,
+                scale_recipe_b=[F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
+                swizzle_a=[F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
+                swizzle_b=[F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
+                output_dtype=torch.bfloat16,
+            )
+
+        elapsed_ms = time_it(gemm, args.iters, args.warmup)
+    return elapsed_ms
+
+
+def measure(x, args, gemm_ms, output_features):
     baseline = lambda: torchao_plain_reference(x)
     fused = lambda: fused_quantize(x)
     m, k = x.shape
-    # Input reads = 2 passes of BF16, two packed-output orientations,
-    # two arrays of one FP8 SF per logical 16-element vector.
+    # Two BF16 input reads, two packed-code orientations, two scale layouts.
     bytes_min = x.numel() * (2 * 2 + 2 * .5 + 2 * (1 / 16))
     ref_ms = time_it(baseline, args.iters, args.warmup)
     fused_ms = time_it(fused, args.iters, args.warmup)
     return {
         "M": m, "features": k, "numel": x.numel(),
         "min_io_GB": round(bytes_min / 1e9, 3),
-        "torchao_ms": round(ref_ms, 3),
-        "fused_ms": round(fused_ms, 3),
+        "torchao_ms": round(ref_ms, 3), "fused_ms": round(fused_ms, 3),
         "speedup": round(ref_ms / fused_ms, 3),
         "torchao_effective_GBs": round(bytes_min / (ref_ms * 1e6), 1),
         "fused_effective_GBs": round(bytes_min / (fused_ms * 1e6), 1),
+        "gemm_ms": round(gemm_ms, 3),
+        "gemm_TFLOPS": round(_gemm_tflops(m, k, output_features, gemm_ms), 2),
+        "torchao_quant_plus_gemm_TFLOPS": round(
+            _gemm_tflops(m, k, output_features, ref_ms + gemm_ms), 2),
+        "fused_quant_plus_gemm_TFLOPS": round(
+            _gemm_tflops(m, k, output_features, fused_ms + gemm_ms), 2),
+        # Both paths have the same minimum data volume; avoid claiming saved
+        # traffic from kernel launch reduction or allocator zero fills.
+        "saved_min_io_bytes": 0,
     }
 
 
@@ -149,7 +198,7 @@ def transformed_correctness(shape=(128, 256), seed=20261020):
     return res
 
 
-def measure_transform(x, args, name):
+def measure_transform(x, args, name, gemm_ms, output_features):
     eps = float(torch.finfo(x.dtype).eps)
     if name == "rmsnorm":
         baseline = lambda: torchao_plain_reference(
@@ -173,9 +222,18 @@ def measure_transform(x, args, name):
         "speedup": round(baseline_ms / fused_ms, 3),
         "torchao_min_io_GB": round(baseline_GB, 3),
         "fused_min_io_GB": round(fused_GB, 3),
+        "saved_materialized_BF16_bytes": 2 * n,
+        "saved_min_io_bytes": 4 * n,  # avoids one BF16 write + one BF16 read
         "saved_activation_GB": round(2 * n / 1e9, 3),
+        "saved_min_io_GB": round(4 * n / 1e9, 3),
         "torchao_effective_GBs": round(baseline_GB / (baseline_ms / 1000), 1),
         "fused_effective_GBs": round(fused_GB / (fused_ms / 1000), 1),
+        "gemm_ms": round(gemm_ms, 3),
+        "gemm_TFLOPS": round(_gemm_tflops(x.shape[0], x.shape[1], output_features, gemm_ms), 2),
+        "torchao_quant_plus_gemm_TFLOPS": round(
+            _gemm_tflops(x.shape[0], x.shape[1], output_features, baseline_ms + gemm_ms), 2),
+        "fused_quant_plus_gemm_TFLOPS": round(
+            _gemm_tflops(x.shape[0], x.shape[1], output_features, fused_ms + gemm_ms), 2),
     }
 
 
@@ -231,12 +289,15 @@ def main():
     for M, K, N in GEMMS:
         if args.skip_large and K >= 32768:
             continue
-        for role, features in (("forward_activation", K), ("grad_output", N)):
+        for role, features, output_features in (
+            ("forward_activation", K, N), ("grad_output", N, K)
+        ):
             x = torch.randn((M, features), device="cuda", dtype=torch.bfloat16)
-            r = measure(x, args)
+            gemm_ms = measure_gemm(x, output_features, args)
+            r = measure(x, args, gemm_ms, output_features)
             print("BENCH", json.dumps({"gemm": [M, K, N], "role": role, "path": "amax_quant", **r}))
             for name in ("rmsnorm", "relu2"):
-                t = measure_transform(x, args, name)
+                t = measure_transform(x, args, name, gemm_ms, output_features)
                 print("BENCH", json.dumps({"gemm": [M, K, N], "role": role, "path": name, **t}))
             del x
 
