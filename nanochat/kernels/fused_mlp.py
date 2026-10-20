@@ -60,7 +60,7 @@ def _weight_quant(w):
     return nv._weight_quantize_2d(w, False)
 
 
-def _scaled_mm(a, asf, a_amax, b, bsf, b_amax):
+def _scaled_mm(a, asf, a_amax, b, bsf, b_amax, b_is_tensor_scale=False):
     """A @ B.T with canonical torchao 32x16 block-scales and tensor-scales."""
     import torchao.prototype.moe_training.nvfp4_training.nvfp4_linear as nv
     F = nv.F
@@ -68,7 +68,7 @@ def _scaled_mm(a, asf, a_amax, b, bsf, b_amax):
         a.view(torch.float4_e2m1fn_x2), b.view(torch.float4_e2m1fn_x2).t(),
         scale_a=[asf.flatten(), nv.per_tensor_amax_to_scale(a_amax)],
         scale_recipe_a=[F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
-        scale_b=[bsf.flatten(), nv.per_tensor_amax_to_scale(b_amax)],
+        scale_b=[bsf.flatten(), b_amax if b_is_tensor_scale else nv.per_tensor_amax_to_scale(b_amax)],
         scale_recipe_b=[F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
         swizzle_a=[F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
         swizzle_b=[F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
