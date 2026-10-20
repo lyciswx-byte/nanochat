@@ -39,8 +39,10 @@ def _fake(x: torch.Tensor, eps: float, return_bf16: bool = False) -> tuple[
 
 
 def _validate_shape(x):
-    if x.ndim != 2 or x.dtype != torch.bfloat16 or x.shape[0] % 128 or x.shape[1] % 128:
-        raise ValueError("needs 2D BF16, dimensions multiples of 128")
+    if (x.ndim != 2 or x.dtype != torch.bfloat16 or x.shape[0] % 128
+            or x.shape[1] % 128 or not x.is_contiguous()
+            or x.device.type != "cuda"):
+        raise ValueError("needs contiguous CUDA 2D BF16, dimensions multiples of 128")
 
 
 def _setup(ctx, inputs, output):
