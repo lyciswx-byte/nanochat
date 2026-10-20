@@ -78,6 +78,8 @@ def prewarm() -> None:
     """Compile/loading explicitly before CUDA Graph capture or torch.compile."""
     if not torch.cuda.is_available():
         raise RuntimeError("sm121 fused NVFP4 needs CUDA")
+    if torch.cuda.get_device_capability() != (12, 1):
+        raise RuntimeError("sm121 fused NVFP4 requires GB10 compute capability 12.1")
     _extension()
     # Run once: ensure CUDA module load and dynamic dispatch happen pre-capture.
     fused_quantize(torch.zeros((128, 128), device="cuda", dtype=torch.bfloat16))
