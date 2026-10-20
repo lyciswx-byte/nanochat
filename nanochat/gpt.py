@@ -15,6 +15,7 @@ Notable features:
 from functools import partial
 from dataclasses import dataclass
 
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -165,9 +166,21 @@ class MLP(nn.Module):
 
     def forward(self, x):
         x = self.c_fc(x)
-        x = F.relu(x).square()
-        x = self.c_proj(x)
-        return x
+        if (os.environ.get("NANOCHAT_NVFP4_FUSED_MLP", "0") == "1"
+                and getattr(self.c_proj, "process_group", object()) is None):
+            from nanochat.kernels.fused_mlp import fused_relu2_linear
+            return fused_relu2_linear(x, self.c_proj)
+        return self.c_proj(F.relu(x).square())
+
+    def forward_fused_norm(self, x):
+        """Fuse RMSNorm into the c_fc NVFP4 operand; skip its BF16 tensor."""
+        from nanochat.kernels.fused_rmsnorm import fused_norm_linear
+        h = fused_norm_linear(x, self.c_fc)
+        if (os.environ.get("NANOCHAT_NVFP4_FUSED_MLP", "0") == "1"
+                and getattr(self.c_proj, "process_group", object()) is None):
+            from nanochat.kernels.fused_mlp import fused_relu2_linear
+            return fused_relu2_linear(h, self.c_proj)
+        return self.c_proj(F.relu(h).square())
 
 
 class Block(nn.Module):
@@ -178,7 +191,12 @@ class Block(nn.Module):
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
-        x = x + self.mlp(norm(x))
+        if (os.environ.get("NANOCHAT_NVFP4_FUSED_RMSNORM", "0") == "1"
+                and x.dtype == torch.bfloat16
+                and getattr(self.mlp.c_fc, "process_group", object()) is None):
+            x = x + self.mlp.forward_fused_norm(x)
+        else:
+            x = x + self.mlp(norm(x))
         return x
 
 
