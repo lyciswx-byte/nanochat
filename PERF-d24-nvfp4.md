@@ -136,3 +136,21 @@ autotune (77 vs 78 TFLOPS). BF16 ceiling on this stack is ~20-22k tok/s dual.
 
 NVFP4 (2.18 s micro-step, 30k dual) is the only measured configuration at the
 target, but it diverges (NaN at step 2-3).
+
+### BF16 round-2 follow-ups (all neutral or failing)
+
+- ATEN GEMM autotune (`is_big_gpu` forced true, backends="ATEN"): 77 vs 78
+  TFLOPS at 32768x1536x6144, 81 vs 81 at 8192^3. cuBLASLt's default heuristic
+  is already the best available.
+- CUTLASS autotune with `_normalize_cuda_arch` remapped to 100: every candidate
+  fails (`Got cutlass error: Error Internal`, `min() iterable argument is empty`).
+  No CUTLASS GEMM config exists for sm_121 in this torch build.
+- `torch._inductor.config.epilogue_fusion = False`: 3.144 s vs 3.141 s. The
+  sm80 CUTLASS relu-epilogue GEMMs (0.80 s, ~55 TFLOPS) are not replaced by
+  cuBLASLt.
+- `torch.mm` itself peaks at 81-83 TFLOPS, so the 1.89 s GEMM share is within
+  8% of the hardware's demonstrated BF16 throughput.
+
+Conclusion: the BF16 ceiling on this stack is ~20-21k tok/s dual-node. Reaching
+30k would need a BF16 GEMM at >120 TFLOPS, which no available kernel provides
+on sm_121, plus non-GEMM work at ~1/4 of today's cost.
