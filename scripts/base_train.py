@@ -192,6 +192,14 @@ if resuming:
 # -----------------------------------------------------------------------------
 # FP8 training initialization and management (this has to be done before torch.compile)
 
+if args.nvfp4 and os.environ.get("NANOCHAT_MASTER_BF16", "1") == "1":
+    # torchao's NVFP4 linear needs a BF16 weight operand. Keeping the master
+    # weights in BF16 avoids a fresh cast (and a quantizer cache miss) on every
+    # micro-step; a separate BF16 shadow buffer is not an option because
+    # torch.compile bakes non-input buffers into the graph.
+    model = model.bfloat16()
+    print0("NVFP4: BF16 master weights")
+
 # Convert Linear layers to Float8Linear if --fp8 is set
 if args.fp8:
     if device_type != "cuda":
@@ -232,7 +240,7 @@ if args.nvfp4:
             print0(f"✓ Fused QKV projections in {num_fused_qkv} attention layers")
         num_linear = sum(1 for m in model.modules() if isinstance(m, torch.nn.Linear))
         num_nvfp4 = convert_to_nvfp4_training(model, use_rht=args.nvfp4_rht)
-        if os.environ.get("NANOCHAT_NVFP4_WEIGHT_SHADOW", "1") == "1":
+        if os.environ.get("NANOCHAT_NVFP4_WEIGHT_SHADOW", "0") == "1":
             from nanochat.nvfp4 import refresh_nvfp4_weight_shadows
             refresh_nvfp4_weight_shadows(model)
         print0(f"✓ NVFP4 training enabled (sm_121a, RTNE backward, RHT={args.nvfp4_rht}) - converted {num_nvfp4}/{num_linear} linear layers")

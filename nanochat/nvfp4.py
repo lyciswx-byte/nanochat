@@ -475,7 +475,7 @@ def convert_to_nvfp4_training(
     # ``_cached_impl``), so Inductor owns every tensor it may donate.
     if os.environ.get("NANOCHAT_NVFP4_CACHE_WEIGHTS", "1") == "1":
         _install_weight_quant_cache()
-    shadow_enabled = os.environ.get("NANOCHAT_NVFP4_WEIGHT_SHADOW", "1") == "1"
+    shadow_enabled = os.environ.get("NANOCHAT_NVFP4_WEIGHT_SHADOW", "0") == "1"
     if shadow_enabled:
         _install_weight_shadow_forward()
     if os.environ.get("NANOCHAT_NVFP4_FAST_ACCUM", "0") == "1":
