@@ -12,6 +12,7 @@
 #include <cuda_fp8.h>
 #include <cooperative_groups.h>
 #include <float.h>
+#include <climits>
 #include <vector>
 namespace cg = cooperative_groups;
 
@@ -160,53 +161,61 @@ quant_coop(const __nv_bfloat16 *__restrict__ x, int M, int N,
         }
         __syncthreads();
 
-        for (int group = 0; group < (TM / 16) * (TN / 16); ++group) {
+        // One warp owns one 16x16 group. Each warp reduces 256 BF16 values,
+        // then emits both packed orientations and both swizzled scale atoms.
+        // 8 warps x 4 rounds = all 32 groups, no inter-warp barriers.
+        int lane = tid & 31;
+        int warp = tid >> 5;
+        for (int pass = 0; pass < 4; ++pass) {
+            int group = pass * 8 + warp;
             int r0 = (group / (TN / 16)) * 16;
             int c0 = (group % (TN / 16)) * 16;
-            int r = r0 + tid / 16;
-            int c = c0 + tid % 16;
-            float value = __bfloat162float(tile[r * TN + c]);
-            float vmax = block_max(fabsf(value), reduce_s);
+            float vmax = 0.0f;
+            for (int k = lane; k < 256; k += 32) {
+                float v = __bfloat162float(
+                    tile[(r0 + k / 16) * TN + c0 + (k % 16)]);
+                vmax = fmaxf(vmax, fabsf(v));
+            }
+            for (int d = 16; d; d >>= 1)
+                vmax = fmaxf(vmax, __shfl_down_sync(0xffffffff, vmax, d));
+            vmax = __shfl_sync(0xffffffff, vmax, 0);
 
-            if (tid == 0) {
-                // Match torchao._nvfp4_2d_quantize exactly, including div.rn
-                // and the E4M3 rounding before the encode reciprocal.
+            unsigned int sf = 0;
+            float enc = 0.0f;
+            if (lane == 0) {
                 float pvscale = fminf(vmax * scale_ratio, 448.0f);
-                uint8_t s = __nv_cvt_float_to_fp8(pvscale, __NV_SATFINITE, __NV_E4M3);
-                float denom = fp8_decode(s) * global_decode;
-                encode_s = fminf(__fdiv_rn(1.0f, denom), FLT_MAX);
-                scale_s = s;
+                sf = __nv_cvt_float_to_fp8(pvscale, __NV_SATFINITE, __NV_E4M3);
+                float denom = fp8_decode(uint8_t(sf)) * global_decode;
+                enc = fminf(__fdiv_rn(1.0f, denom), FLT_MAX);
             }
-            __syncthreads();
+            sf = __shfl_sync(0xffffffff, sf, 0);
+            enc = __shfl_sync(0xffffffff, enc, 0);
 
-            float enc = encode_s;
-            uint8_t s = scale_s;
-            if (tid < 16) {
-                int rr = rbase + r0 + tid;
+            if (lane < 16) {
+                int rr = rbase + r0 + lane;
                 int cc = cbase + c0;
-                row_sf[sf_index(rr, cc, N)] = s;
-                int tr = cbase + c0 + tid;
+                row_sf[sf_index(rr, cc, N)] = uint8_t(sf);
+                int tr = cbase + c0 + lane;
                 int tc = rbase + r0;
-                col_sf[sf_index(tr, tc, M)] = s;
+                col_sf[sf_index(tr, tc, M)] = uint8_t(sf);
             }
-            if (tid < 128) {
-                int rr = r0 + tid / 8;
-                int cc = c0 + 2 * (tid % 8);
+            for (int k = lane; k < 128; k += 32) {
+                int rr = r0 + k / 8;
+                int cc = c0 + 2 * (k % 8);
                 float x0 = __bfloat162float(tile[rr * TN + cc]) * enc;
                 float x1 = __bfloat162float(tile[rr * TN + cc + 1]) * enc;
                 row[int64_t(rbase + rr) * (N / 2) + (cbase + cc) / 2] =
                     fp4_pair(fminf(fmaxf(x0, -6.0f), 6.0f),
                              fminf(fmaxf(x1, -6.0f), 6.0f));
 
-                int tr = c0 + tid / 8;
-                int tc = r0 + 2 * (tid % 8);
+                int tr = c0 + k / 8;
+                int tc = r0 + 2 * (k % 8);
                 x0 = __bfloat162float(tile[tc * TN + tr]) * enc;
                 x1 = __bfloat162float(tile[(tc + 1) * TN + tr]) * enc;
                 col[int64_t(cbase + tr) * (M / 2) + (rbase + tc) / 2] =
                     fp4_pair(fminf(fmaxf(x0, -6.0f), 6.0f),
                              fminf(fmaxf(x1, -6.0f), 6.0f));
             }
-            __syncthreads();
         }
         __syncthreads();
     }
