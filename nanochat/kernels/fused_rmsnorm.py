@@ -75,6 +75,7 @@ def _backward(ctx, *grads):
 fused_rmsnorm_quant.register_autograd(_backward, setup_context=_setup)
 
 
+@torch._dynamo.allow_in_graph
 class _RMSNormNVFP4Linear(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, master_weight, shadow, eps):
