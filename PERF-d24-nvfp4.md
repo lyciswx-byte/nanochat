@@ -104,3 +104,35 @@ So the objective is blocked on two independent, measured conditions:
    `sm_121` image; CUDA-graph capture fails with the weight cache).
 2. **Stability.** The 30k tok/s NVFP4 path diverges on d24 (NaN at step 2-3,
    plain or RHT, single or dual node). The stable FP8 path is ~22k tok/s.
+
+## BF16 (BF16 master) — measured ceiling
+
+Two-node, d24, B=16, T=2048, 4 steps, `NANOCHAT_MASTER_BF16=1`, no low precision:
+
+| step | tok/s | loss |
+|---|---|---|
+| 0 | 19,304 | 10.397177 |
+| 1 | 20,246 | 10.369998 |
+| 2 | 20,049 | 10.323536 |
+| 3 | 20,187 | 10.252126 |
+
+Single-node micro-step 3.14 s (fwd 1.02 + bwd 2.12), 54.5 GB peak.
+
+### Why 30k is outside the roofline
+
+- BF16 matmul peak measured on GB10: **81-83 TFLOPS** (8192^3), **74-78 TFLOPS**
+  at the model shapes. Plain `torch.mm` and ATEN-autotuned are identical.
+  Inductor's CUTLASS templates abort on sm_121 (`architecture > 107`), and
+  max-autotune is disabled below 68 SMs (GB10 has 48).
+- Model matmul work is 143.5 TFLOP per micro-step, so GEMM alone is 1.73-1.91 s.
+- 30k dual-node = 15k/GPU = 2.18 s per micro-step, leaving 0.29-0.45 s for
+  everything else. Non-GEMM measured: attention 0.31 s, ReLU^2 0.24 s,
+  RMSNorm 0.20 s, embeddings/CE/add 0.50 s = 1.28 s.
+- Even with zero non-GEMM the BF16 step cannot go below ~1.73 s.
+
+Tried and rejected: `mode="reduce-overhead"` (3.148 s), `max-autotune-no-cudagraphs`
+(3.210 s, gate disabled), fused QKV for BF16 (3.163 s vs 3.126 s), ATEN GEMM
+autotune (77 vs 78 TFLOPS). BF16 ceiling on this stack is ~20-22k tok/s dual.
+
+NVFP4 (2.18 s micro-step, 30k dual) is the only measured configuration at the
+target, but it diverges (NaN at step 2-3).
