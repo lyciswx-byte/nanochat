@@ -236,7 +236,6 @@ void check_scalar(const torch::Tensor& x,const torch::Tensor& a,const char* labe
 }
 void check_packed(const torch::Tensor& a,const torch::Tensor& bp,
                   const torch::Tensor& sf,const torch::Tensor& bglobal) {
-  check_common(a,bp,torch::empty({1},a.options().dtype(at::kFloat)),true);
   TORCH_CHECK(sf.is_cuda() && sf.device()==a.device() && sf.scalar_type()==at::kByte &&
               sf.is_contiguous() && sf.dim()==2 && sf.size(0)==bp.size(0) &&
               sf.size(1)==a.size(1)/16, "B scales must be uint8 [N,K/16]");
