@@ -63,6 +63,8 @@ def _fake_fused_quantize(x: torch.Tensor) -> tuple[
     m, n = x.shape
     if m % 128 or n % 128:
         raise ValueError("fused NVFP4 requires M,N multiples of 128")
+    if not x.is_contiguous() or x.device.type != "cuda":
+        raise ValueError("fused NVFP4 requires contiguous CUDA input")
     return (
         x.new_empty((m, n // 2), dtype=torch.uint8),
         x.new_empty((m // 128, n // 64, 32, 16), dtype=torch.float8_e4m3fn),
