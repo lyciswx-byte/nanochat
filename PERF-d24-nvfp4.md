@@ -80,3 +80,27 @@ FLOPs (63% of the 209 TFLOP/s BF16 peak, 26% of the 500 TFLOP/s NVFP4 peak).
   error because the weight cache creates tensors outside the capture. Making it
   graph-safe needs the quantized weights expressed as real buffers updated in
   place, which is part of the fused-kernel work.
+
+## Round 3: stability is the second blocker
+
+| Path (d24, B=16, single node, 4 steps) | tok/s/GPU | loss trajectory |
+|---|---|---|
+| FP8 | 11.2k | 10.3984 -> 10.3988, finite |
+| NVFP4 + RHT | 12.6k | 10.3973 -> 10.2986, finite |
+| NVFP4 plain | 15.0k | NaN at step 3 |
+
+On the **two-node** setup, NVFP4 + RHT also reaches NaN at step 2
+(`dt` 42.3 s -> 38.8 s, loss `10.373` -> `nan`), so RHT does not make the fast
+path usable there. FP8 stays finite and is the only stable low-precision path
+measured so far, at roughly 22k tok/s dual-node.
+
+So the objective is blocked on two independent, measured conditions:
+
+1. **Throughput.** 60k needs 1.09 s per GPU micro-step; the measured step is
+   2.18 s. GEMMs alone are 0.54 s and already run at 54-68% of NVFP4 peak. The
+   other 1.64 s is memory-bound and needs roughly a 3x traffic reduction, which
+   requires fused quantize+GEMM / fused-MLP kernels that do not exist for
+   `sm_121` in torchao, PyTorch or Quack (Quack's dense kernels have no
+   `sm_121` image; CUDA-graph capture fails with the weight cache).
+2. **Stability.** The 30k tok/s NVFP4 path diverges on d24 (NaN at step 2-3,
+   plain or RHT, single or dual node). The stable FP8 path is ~22k tok/s.
