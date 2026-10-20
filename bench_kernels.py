@@ -19,6 +19,9 @@ from collections import OrderedDict
 
 import torch
 from nanochat.kernels.fused_quant import fused_quantize, prewarm, torchao_plain_reference
+from nanochat.kernels.fused_rmsnorm import fused_rmsnorm_quant
+from nanochat.kernels.fused_mlp import fused_relu2_quant
+import torch.nn.functional as F
 
 
 GEMMS = [
@@ -113,6 +116,69 @@ def measure(x, args):
     }
 
 
+
+def transformed_correctness(shape=(128, 256), seed=20261020):
+    torch.manual_seed(seed)
+    x = (torch.randn(shape, device="cuda") * 0.6).bfloat16()
+    eps = float(torch.finfo(x.dtype).eps)
+    paths = [
+        ("rmsnorm", lambda: F.rms_norm(x, (x.shape[-1],), eps=eps),
+         lambda: fused_rmsnorm_quant(x, eps, True)),
+        ("relu2", lambda: F.relu(x).square(),
+         lambda: fused_relu2_quant(x, True)),
+    ]
+    res = []
+    for name, transform, fused in paths:
+        hp = transform()
+        reference = torchao_plain_reference(hp)
+        result = fused()
+        codes_equal = bool(torch.equal(reference[0], result[0]))
+        sf_equal = bool(torch.equal(reference[1].view(torch.uint8),
+                                    result[1].view(torch.uint8)))
+        hp_delta = float((hp.float() - result[5].float()).abs().max())
+        # A new scale can move FP4 choices near tie boundaries. Report
+        # dequantized delta, not only packed-byte equality.
+        dq_ref = dequant(reference[0], reference[1], reference[4])
+        dq_new = dequant(result[0], result[1], result[4])
+        dequant_mae = float((dq_ref - dq_new).abs().mean())
+        res.append({
+            "path": name, "shape": shape, "codes_equal": codes_equal,
+            "scales_equal": sf_equal, "hp_max_delta": hp_delta,
+            "dequant_mae_delta": dequant_mae,
+        })
+    return res
+
+
+def measure_transform(x, args, name):
+    eps = float(torch.finfo(x.dtype).eps)
+    if name == "rmsnorm":
+        baseline = lambda: torchao_plain_reference(
+            F.rms_norm(x, (x.shape[-1],), eps=eps))
+        fused = lambda: fused_rmsnorm_quant(x, eps, False)
+    elif name == "relu2":
+        baseline = lambda: torchao_plain_reference(F.relu(x).square())
+        fused = lambda: fused_relu2_quant(x, False)
+    else:
+        raise ValueError(name)
+    baseline_ms = time_it(baseline, args.iters, args.warmup)
+    fused_ms = time_it(fused, args.iters, args.warmup)
+    n = x.numel()
+    # Baseline: 1 read + 1 write for BF16 transform, then 2 reads for
+    # torchao amax/quant, 1B packed codes and 1/8B scale bytes per input.
+    baseline_GB = n * (2 + 2 + 2 * 2 + 1 + 1 / 8) / 1e9
+    fused_GB = n * (2 * 2 + 1 + 1 / 8) / 1e9
+    return {
+        "M": x.shape[0], "features": x.shape[1],
+        "torchao_ms": round(baseline_ms, 3), "fused_ms": round(fused_ms, 3),
+        "speedup": round(baseline_ms / fused_ms, 3),
+        "torchao_min_io_GB": round(baseline_GB, 3),
+        "fused_min_io_GB": round(fused_GB, 3),
+        "saved_activation_GB": round(2 * n / 1e9, 3),
+        "torchao_effective_GBs": round(baseline_GB / (baseline_ms / 1000), 1),
+        "fused_effective_GBs": round(fused_GB / (fused_ms / 1000), 1),
+    }
+
+
 def autograd_smoke():
     from nanochat.nvfp4 import convert_to_nvfp4_training
     import torch.nn as nn
@@ -155,6 +221,9 @@ def main():
         print("CORRECTNESS", json.dumps(v))
         if not v["pass"]:
             raise AssertionError(f"torchao layout/code mismatch: {shape}")
+    for shape in ((128, 128), (128, 256), (1024, 1536)):
+        for result in transformed_correctness(shape):
+            print("TRANSFORM_CORRECTNESS", json.dumps(result))
     if args.autograd_smoke:
         print(autograd_smoke())
     if args.check_only:
@@ -165,7 +234,10 @@ def main():
         for role, features in (("forward_activation", K), ("grad_output", N)):
             x = torch.randn((M, features), device="cuda", dtype=torch.bfloat16)
             r = measure(x, args)
-            print("BENCH", json.dumps({"gemm": [M, K, N], "role": role, **r}))
+            print("BENCH", json.dumps({"gemm": [M, K, N], "role": role, "path": "amax_quant", **r}))
+            for name in ("rmsnorm", "relu2"):
+                t = measure_transform(x, args, name)
+                print("BENCH", json.dumps({"gemm": [M, K, N], "role": role, "path": name, **t}))
             del x
 
 
