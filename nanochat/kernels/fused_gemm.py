@@ -237,7 +237,7 @@ def _amax(a: torch.Tensor, scale_mode: str,
         if given is not None:
             raise ValueError(f"{label}: exact mode must measure the tensor")
         # Reduces before the GEMM: global synchronization *between* kernels.
-        return a.float().abs().amax().reshape(1)
+        return torch.linalg.vector_norm(a, ord=float("inf")).float().reshape(1)
     if scale_mode != "static":
         raise ValueError("scale_mode must be 'exact' or 'static'")
     if given is None:
