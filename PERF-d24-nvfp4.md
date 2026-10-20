@@ -154,3 +154,20 @@ target, but it diverges (NaN at step 2-3).
 Conclusion: the BF16 ceiling on this stack is ~20-21k tok/s dual-node. Reaching
 30k would need a BF16 GEMM at >120 TFLOPS, which no available kernel provides
 on sm_121, plus non-GEMM work at ~1/4 of today's cost.
+
+## cuBLAS-direct BF16 linear (gb10-dissection follow-up)
+
+The gb10-dissection repo reports BF16 cuBLAS at 97.69 TFLOP/s (8192^3); we
+reproduced its binary on this machine at 89.6 mean / 101.9 best, and a direct
+`cublasGemmEx` at the model shapes at 87-89 TFLOP/s versus PyTorch's 77.
+
+Implemented `nanochat/kernels/cublas_linear.py` + `csrc/cublas_linear.cu`
+(forward NT, dgrad NN, wgrad) behind `NANOCHAT_CUBLAS_LINEAR=1`. It is
+bit-exact against `F.linear` for forward and both gradients on every shape
+tested, and is invoked 158 times per compiled step.
+
+End-to-end it is **neutral**: 3.142 s vs 3.141 s for the d24 BF16 step
+(peak allocation rises 46.7 -> 53.0 GiB because Inductor can no longer fuse
+the relu epilogue into the MLP GEMMs). The standalone 89 vs 77 TFLOP/s gap does
+not translate to the compiled model, so the BF16 GEMM share is already at the
+achieved rate and this route cannot close the 30k gap.

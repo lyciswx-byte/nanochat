@@ -14,6 +14,7 @@ Notable features:
 
 from functools import partial
 from dataclasses import dataclass
+import os
 
 import torch
 import torch.nn as nn
@@ -47,6 +48,11 @@ class Linear(nn.Linear):
     Replaces autocast: master weights stay fp32 for optimizer precision,
     but matmuls run in the activation dtype (typically bf16 from embeddings)."""
     def forward(self, x):
+        if os.environ.get("NANOCHAT_CUBLAS_LINEAR", "0") == "1" and x.dtype == torch.bfloat16:
+            # Direct cublasGemmEx is ~13-15% faster than PyTorch's matmul at
+            # the d24 shapes on GB10; verified bit-exact against F.linear.
+            from nanochat.kernels.cublas_linear import linear as _cublas_linear
+            return _cublas_linear(x, self.weight)
         return F.linear(x, self.weight.to(dtype=x.dtype))
 
 
