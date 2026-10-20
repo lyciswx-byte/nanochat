@@ -7,6 +7,7 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -44,7 +45,7 @@ __device__ __forceinline__ uint8_t e2m1code(float x) {
       best=c; err=e;
     }
   }
-  return uint8_t(best | (signbit(x) ? 8 : 0));
+  return uint8_t(best | ((__float_as_uint(x)&0x80000000u) ? 8 : 0));
 }
 __device__ __forceinline__ uint32_t ld4(const uint8_t* p) {
   return uint32_t(p[0]) | (uint32_t(p[1])<<8) |
