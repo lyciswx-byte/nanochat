@@ -268,6 +268,22 @@ def _use_plain_quantization():
     )
 
     def _plain_amax(x, sign_vector_list, use_cutedsl):
+        # Fixed outer scale removes the global read entirely and leaves the
+        # 16-value block scales adaptive. It is NOT an exact global amax;
+        # only opt into this experiment after loss/BPB comparison.
+        fixed = os.environ.get("NANOCHAT_NVFP4_FIXED_AMAX", "")
+        if fixed:
+            fixed_value = float(fixed)
+            if not 0 < fixed_value < float("inf"):
+                raise ValueError("NANOCHAT_NVFP4_FIXED_AMAX must be finite and > 0")
+            amax = torch.full((), fixed_value, device=x.device, dtype=x.dtype)
+            return amax, amax
+        if (not use_cutedsl and
+                os.environ.get("NANOCHAT_NVFP4_FUSED_RMSNORM", "0") == "1" and
+                os.environ.get("NANOCHAT_NVFP4_AMAX_FP32", "0") != "1"):
+            from nanochat.fused_rmsnorm import rmsnorm_or_plain_amax
+            amax = rmsnorm_or_plain_amax(x)
+            return amax, amax
         # The input is BF16 and the NVFP4 block scale is E4M3, so converting
         # every activation tile to FP32 just to find a global maximum adds a
         # full tensor pass without changing the scale at useful precision.

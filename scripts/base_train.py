@@ -225,6 +225,10 @@ if args.nvfp4:
             print0(f"✓ Fused QKV projections in {num_fused_qkv} attention layers")
         num_linear = sum(1 for m in model.modules() if isinstance(m, torch.nn.Linear))
         num_nvfp4 = convert_to_nvfp4_training(model, use_rht=args.nvfp4_rht)
+        if os.environ.get("NANOCHAT_NVFP4_FUSED_RMSNORM", "0") == "1":
+            print0("NVFP4: fused RMSNorm + per-row amax enabled (experimental)")
+        if os.environ.get("NANOCHAT_NVFP4_FIXED_AMAX", ""):
+            print0("NVFP4: FIXED activation amax enabled; validate convergence")
         print0(f"✓ NVFP4 training enabled (sm_121a, RTNE backward, RHT={args.nvfp4_rht}) - converted {num_nvfp4}/{num_linear} linear layers")
 
 # Context manager to temporarily disable low-precision Linears so that model
@@ -280,6 +284,8 @@ def disable_fp8(model):
 # Compile the model
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
+if os.environ.get("NANOCHAT_CHUNKED_CE", "0") == "1":
+    print0(f"Chunked LM-head CE: {os.environ.get('NANOCHAT_CHUNKED_CE_ROWS', '2048')} rows (training only)")
 model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 
 # Multi-node compile warmup. torch.compile is lazy, so if one node has cached kernels from a previous run and the other doesn't, the fast rank's first forward takes ms while the slow rank compiles for 30-120+s.
@@ -615,6 +621,9 @@ while True:
         # Weights changed in optimizer.step(); drop the cached NVFP4 weights.
         from nanochat.nvfp4 import invalidate_weight_cache
         invalidate_weight_cache()
+        if os.environ.get("NANOCHAT_NVFP4_FUSED_RMSNORM", "0") == "1":
+            from nanochat.fused_rmsnorm import clear_rmsnorm_amax_cache
+            clear_rmsnorm_amax_cache()
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()
     t1 = time.time()

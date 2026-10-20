@@ -13,6 +13,7 @@ Notable features:
 """
 
 from functools import partial
+import os
 from dataclasses import dataclass
 
 import torch
@@ -39,7 +40,13 @@ class GPTConfig:
     window_pattern: str = "SSSL"
 
 
-def norm(x):
+def norm(x, nvfp4_fused=False):
+    # Opt-in Triton RMSNorm emits BF16 normalized values and their row maxima
+    # in one pass. The latter are consumed by the plain NVFP4 amax hook.
+    # Keep inference, BF16 evaluation, and other norm call sites unchanged.
+    if nvfp4_fused and os.environ.get("NANOCHAT_NVFP4_FUSED_RMSNORM", "0") == "1":
+        from nanochat.fused_rmsnorm import fused_rmsnorm
+        return fused_rmsnorm(x)
     return F.rms_norm(x, (x.size(-1),)) # note that this will run in bf16, seems ok
 
 class Linear(nn.Linear):
@@ -177,8 +184,8 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
-        x = x + self.mlp(norm(x))
+        x = x + self.attn(norm(x, nvfp4_fused=self.training), ve, cos_sin, window_size, kv_cache)
+        x = x + self.mlp(norm(x, nvfp4_fused=self.training))
         return x
 
 
@@ -494,6 +501,19 @@ class GPT(nn.Module):
         if x_backout is not None:
             x = x - self.backout_lambda.to(x.dtype) * x_backout
         x = norm(x)
+
+        # During training, keep logits private to row chunks: avoid the
+        # [B*T, vocab] BF16 tensor and multi-GB FP32 softmax intermediates.
+        # BF16 eval and inference retain the identical reference path below.
+        if (targets is not None and self.training and kv_cache is None
+                and os.environ.get("NANOCHAT_CHUNKED_CE", "0") == "1"
+                and isinstance(self.lm_head, Linear)):
+            from nanochat.fused_loss import chunked_lm_cross_entropy
+            return chunked_lm_cross_entropy(
+                x, self.lm_head.weight, targets, self.config.vocab_size,
+                rows=int(os.environ.get("NANOCHAT_CHUNKED_CE_ROWS", "2048")),
+                reduction=loss_reduction,
+            )
 
         # Forward the lm_head (compute logits)
         softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
