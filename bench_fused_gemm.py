@@ -170,6 +170,7 @@ def run(args: argparse.Namespace) -> None:
             "fused_tflops":round(ops/(ms*1e-3)/1e12,3),
             "baseline_tflops":None if baseline_ms is None else round(ops/(baseline_ms*1e-3)/1e12,3),
             "effective_gbps_lower_bound":round(bytes_min/(ms*1e-3)/1e9,3),
+            "baseline_effective_gbps_lower_bound":None if baseline_ms is None else round(bytes_min/(baseline_ms*1e-3)/1e9,3),
             "avoided_packed_intermediate_GiB":round(removed_intermediates/2**30,3),
             "static_vs_exact":em, "fp4_output_dequant_vs_exact":ep,
             "baseline_error":baseline_error,
