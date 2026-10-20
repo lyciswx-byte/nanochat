@@ -64,6 +64,15 @@ def test_norm_and_relu_correctness(shape):
         assert float(diff.abs().mean()) < .035, (name, float(diff.abs().mean()))
 
 
+def test_nan_visible_in_amax():
+    x = torch.zeros((128, 128), dtype=torch.bfloat16, device="cuda")
+    x[47, 21] = float("nan")
+    # We intentionally make no assertion about codes from an invalid tensor.
+    # The FP32 tensor-wide maximum must expose a NaN rather than hiding it.
+    out = fused_quantize(x)
+    assert torch.isnan(out[4])
+
+
 def test_compile_fake_and_execute():
     x = torch.randn((128, 128), device="cuda", dtype=torch.bfloat16)
     f = torch.compile(lambda a: fused_quantize(a)[0], fullgraph=True)
