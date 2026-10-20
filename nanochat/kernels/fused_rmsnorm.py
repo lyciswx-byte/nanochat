@@ -83,7 +83,7 @@ class _RMSNormNVFP4Linear(torch.autograd.Function):
         row, rsf, col, csf, amax, _ = fused_rmsnorm_quant(orig, eps, False)
         w = shadow if shadow.numel() else master_weight.to(torch.bfloat16)
         wr, wsf, wgs, wc, wcsf, wamax = _weight_quant(w)
-        output = _scaled_mm(row, rsf, amax, wr, wsf, wgs).reshape(
+        output = _scaled_mm(row, rsf, amax, wr, wsf, wgs, b_is_tensor_scale=True).reshape(
             *src_shape[:-1], master_weight.shape[0]
         )
         ctx.save_for_backward(x, col, csf, amax, wc, wcsf, wamax)
