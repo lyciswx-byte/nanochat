@@ -192,13 +192,14 @@ if resuming:
 # -----------------------------------------------------------------------------
 # FP8 training initialization and management (this has to be done before torch.compile)
 
-if args.nvfp4 and os.environ.get("NANOCHAT_MASTER_BF16", "1") == "1":
-    # torchao's NVFP4 linear needs a BF16 weight operand. Keeping the master
-    # weights in BF16 avoids a fresh cast (and a quantizer cache miss) on every
-    # micro-step; a separate BF16 shadow buffer is not an option because
-    # torch.compile bakes non-input buffers into the graph.
+_master_bf16_default = "1" if args.nvfp4 else "0"
+if os.environ.get("NANOCHAT_MASTER_BF16", _master_bf16_default) == "1":
+    # torchao's NVFP4 linear needs a BF16 weight operand, and keeping the
+    # master weights in BF16 avoids a fresh cast (and a quantizer cache miss)
+    # on every micro-step. Also usable with --fp8 and plain BF16 for A/B
+    # precision and memory comparisons.
     model = model.bfloat16()
-    print0("NVFP4: BF16 master weights")
+    print0("BF16 master weights")
 
 # Convert Linear layers to Float8Linear if --fp8 is set
 if args.fp8:

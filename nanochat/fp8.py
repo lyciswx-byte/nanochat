@@ -130,7 +130,12 @@ def _quantize_weight_cached_impl(weight: torch.Tensor) -> tuple[torch.Tensor, to
     cached = _weight_quant_cache.get(key)
     if cached is not None:
         _weight_quant_cache_stats["hit"] += 1
-        return cached
+        # Inductor owns custom-op outputs and may donate/free their storage.
+        # Returning the cached tensors themselves let it overwrite the packed
+        # FP8 weights between micro-steps (same failure mode as the NVFP4
+        # cache: loss stayed flat instead of decreasing). Hand back fresh
+        # allocations; the copy is far cheaper than re-quantizing.
+        return tuple(t.clone() for t in cached)
     # Drop prior versions of this parameter before storing the new one.  This
     # bounds host references and lets the allocator reclaim stale FP8 copies.
     ptr = key[0]
@@ -140,7 +145,7 @@ def _quantize_weight_cached_impl(weight: torch.Tensor) -> tuple[torch.Tensor, to
     _weight_quant_cache_stats["miss"] += 1
     out = _to_fp8(weight, torch.float8_e4m3fn)
     _weight_quant_cache[key] = out
-    return out
+    return tuple(t.clone() for t in out)
 
 
 # Keep this operation opaque to AOTAutograd/Inductor so the Python cache check
