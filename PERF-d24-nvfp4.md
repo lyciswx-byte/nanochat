@@ -65,3 +65,18 @@ FLOPs (63% of the 209 TFLOP/s BF16 peak, 26% of the 500 TFLOP/s NVFP4 peak).
   Inductor; copying new master values after `optimizer.step()` never reaches
   the forward, so training optimises stale weights and diverges. BF16 master
   weights are used instead.
+
+## Negative results (round 2)
+
+- **Batch 24**: 3266 ms for 24x2048 tokens, exactly the same 15.0k tok/s/GPU as
+  B=16 (2179 ms for 16x2048). Per-token cost is flat in batch size, so a larger
+  micro-batch does not amortise anything. B=32 needs ~100 GB of GPU allocation
+  and would exceed the 110 GB host budget.
+- **Quack dense GEMM**: `quack.gemm` fails on sm_121 with
+  `cudaErrorNoKernelImageForDevice` (18/18 autotune configs rejected); torch's
+  plain BF16 mm reaches 83 TFLOP/s. Quack's block-scaled path runs but is
+  slower than torchao's `scaled_mm` here, so it is not a drop-in replacement.
+- **CUDA graphs** (`mode="reduce-overhead"`): capture fails with a data-pointer
+  error because the weight cache creates tensors outside the capture. Making it
+  graph-safe needs the quantized weights expressed as real buffers updated in
+  place, which is part of the fused-kernel work.
