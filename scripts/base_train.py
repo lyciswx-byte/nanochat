@@ -46,6 +46,10 @@ parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (e
 # FP8 training
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU and torchao)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
+# NVFP4 training (experimental torchao path for Blackwell sm_121a+)
+parser.add_argument("--nvfp4", action="store_true", help="enable experimental NVFP4 training via torchao (GB10 / sm_121a)")
+parser.add_argument("--nvfp4-rht", action="store_true", help="use randomized Hadamard transform for NVFP4 activation quantization (more accurate, slower)")
+parser.add_argument("--nvfp4-fuse-qkv", action="store_true", help="fuse each attention Q/K/V projection into one NVFP4 GEMM")
 # Model architecture
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
@@ -88,6 +92,21 @@ master_process = ddp_rank == 0 # this process will do logging, checkpointing etc
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
 get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
 if device_type == "cuda":
+    # torch.compile launches a Python worker for each Inductor compile thread.
+    # On GB10's unified-memory system those workers compete with model storage
+    # and CUDA allocations, so the default (20) can exceed physical DRAM while
+    # compiling a large training graph. Keep this bounded and overridable for
+    # machines with more memory; one worker is the safe default for Spark.
+    import torch._inductor.config as _inductor_config
+    _compile_threads = int(os.environ.get("NANOCHAT_COMPILE_THREADS", "1"))
+    if _compile_threads < 1:
+        raise ValueError("NANOCHAT_COMPILE_THREADS must be >= 1")
+    _inductor_config.compile_threads = _compile_threads
+    # Triton/C++ helper builds can fan out independently of Inductor's Python
+    # pool. Keep that second layer bounded when the trainer is launched
+    # directly instead of through the Spark bundle wrapper.
+    os.environ.setdefault("MAX_JOBS", "1")
+    print0(f"Inductor compile threads: {_compile_threads}")
     gpu_device_name = torch.cuda.get_device_name(0)
     gpu_peak_flops = get_peak_flops(gpu_device_name)
     print0(f"GPU: {gpu_device_name} | Peak FLOPS (BF16): {gpu_peak_flops:.2e}")
@@ -193,20 +212,36 @@ if args.fp8:
         num_skipped = num_linear - num_fp8
         print0(f"✓ FP8 training enabled ({args.fp8_recipe} scaling) - converted {num_fp8}/{num_linear} linear layers, skipped {num_skipped} (too small)")
 
-# Context manager to temporarily disable FP8 so that model evaluation remains in BF16
+# NVFP4 training initialization (also before torch.compile)
+if args.nvfp4:
+    if args.fp8:
+        raise SystemExit("--fp8 and --nvfp4 are mutually exclusive")
+    if device_type != "cuda":
+        print0("Warning: NVFP4 training requires CUDA, ignoring --nvfp4 flag")
+    else:
+        from nanochat.nvfp4 import convert_to_nvfp4_training, fuse_qkv_projections
+        if args.nvfp4_fuse_qkv:
+            num_fused_qkv = fuse_qkv_projections(model)
+            print0(f"✓ Fused QKV projections in {num_fused_qkv} attention layers")
+        num_linear = sum(1 for m in model.modules() if isinstance(m, torch.nn.Linear))
+        num_nvfp4 = convert_to_nvfp4_training(model, use_rht=args.nvfp4_rht)
+        print0(f"✓ NVFP4 training enabled (sm_121a, RTNE backward, RHT={args.nvfp4_rht}) - converted {num_nvfp4}/{num_linear} linear layers")
+
+# Context manager to temporarily disable low-precision Linears so that model
+# evaluation remains in BF16.
 @contextmanager
 def disable_fp8(model):
-    """Temporarily swap Float8Linear modules with nn.Linear for BF16 evaluation.
+    """Temporarily swap Float8Linear / NVFP4Linear modules with nn.Linear for BF16 evaluation.
 
     CastConfig is a frozen dataclass, so we can't mutate scaling_type. Instead,
-    we swap out Float8Linear modules entirely and restore them after.
+    we swap out the low-precision modules entirely and restore them after.
     """
     import torch.nn as nn
 
     # Find all Float8Linear modules and their locations
     fp8_locations = []  # list of (parent_module, attr_name, fp8_module)
     for name, module in model.named_modules():
-        if 'Float8' in type(module).__name__:
+        if type(module).__name__ == 'NVFP4Linear' or 'Float8' in type(module).__name__:
             if '.' in name:
                 parent_name, attr_name = name.rsplit('.', 1)
                 parent = model.get_submodule(parent_name)
@@ -251,9 +286,13 @@ model = torch.compile(model, dynamic=False) # the inputs to model will never cha
 # DDP's async all-reduce lets the fast rank race ahead, finish the loop, and the slow rank's NCCL ops then lose their peer and the watchdog kills the job (see Edward Yang "State of torch.compile for training" Aug 2025).
 # Fix: trigger compilation on all ranks here with a dummy fwd+bwd, then barrier. Only needed for multi-node (ddp_world_size > 1).
 if ddp and ddp_world_size > 1:
-    warmup_x = torch.randint(0, model_config.vocab_size, (1, model_config.sequence_len), device=device)
-    warmup_y = torch.randint(0, model_config.vocab_size, (1, model_config.sequence_len), device=device)
-    # 1) Compile the FP8 training graph (forward + backward)
+    # Compile the exact training shape before entering the distributed loop.
+    # A batch-1 warmup leaves the real device batch to compile after the
+    # barrier, which is especially expensive for NVFP4 and can create a large
+    # unified-memory spike on the first training step.
+    warmup_x = torch.randint(0, model_config.vocab_size, (args.device_batch_size, model_config.sequence_len), device=device)
+    warmup_y = torch.randint(0, model_config.vocab_size, (args.device_batch_size, model_config.sequence_len), device=device)
+    # 1) Compile the FP8/NVFP4 training graph (forward + backward)
     warmup_loss = model(warmup_x, warmup_y)
     warmup_loss.backward()
     model.zero_grad(set_to_none=True)
@@ -261,11 +300,12 @@ if ddp and ddp_world_size > 1:
     # 2) Compile the BF16 eval graph (forward only, FP8 disabled). disable_fp8 swaps Float8Linear -> Linear, which invalidates torch.compile's guards and forces recompilation.
     # Without this warmup the recompile happens at the first eval step on top of full training memory - on UMA systems (DGX Spark) the spike can exceed physical DRAM and crash.
     model.eval()
+    eval_warmup_x = torch.randint(0, model_config.vocab_size, (1, model_config.sequence_len), device=device)
     with torch.no_grad():
         with disable_fp8(model):
-            model(warmup_x)
+            model(eval_warmup_x)
     model.train()
-    del warmup_x, warmup_y
+    del warmup_x, warmup_y, eval_warmup_x
     torch.cuda.empty_cache()
     dist.barrier()
     print0("Multi-node compile warmup complete")
@@ -565,6 +605,16 @@ while True:
     else:
         optimizer.step()
     model.zero_grad(set_to_none=True)
+    if args.fp8:
+        # Packed FP8 weights are reused across gradient-accumulation microsteps
+        # but become stale after optimizer.step(). Release them immediately so
+        # old versions cannot accumulate in unified memory.
+        from nanochat.fp8 import clear_fp8_weight_cache
+        clear_fp8_weight_cache()
+    if args.nvfp4:
+        # Weights changed in optimizer.step(); drop the cached NVFP4 weights.
+        from nanochat.nvfp4 import invalidate_weight_cache
+        invalidate_weight_cache()
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()
     t1 = time.time()

@@ -71,11 +71,27 @@ generates a different graph. Numerics are bitwise identical in eager mode.
 
 import torch
 import torch.nn as nn
+import os
 
 from nanochat.common import COMPUTE_DTYPE
 
 # Avoid division by zero when computing scale from an all-zeros tensor
 EPS = 1e-12
+FP8_FAST_ACCUM_BACKWARD = os.environ.get("NANOCHAT_FP8_FAST_ACCUM_BACKWARD", "0") == "1"
+FP8_GRAD_DTYPE = (
+    torch.float8_e4m3fn
+    if os.environ.get("NANOCHAT_FP8_GRAD_DTYPE", "e5m2").lower() == "e4m3"
+    else torch.float8_e5m2
+)
+
+# Weight quantization is independent of the micro-batch.  The training loop
+# can execute several forward/backward passes before one optimizer update, so
+# keeping one packed copy per parameter avoids repeating the same amax/recast
+# work on every micro-step.  The key includes the in-place version counter;
+# optimizer updates therefore invalidate the entry without retaining old
+# versions indefinitely.
+_weight_quant_cache = {}
+_weight_quant_cache_stats = {"hit": 0, "miss": 0}
 
 
 @torch.no_grad()
@@ -107,6 +123,48 @@ def _to_fp8(x, fp8_dtype):
     return x_fp8, inv_scale
 
 
+@torch.no_grad()
+def _quantize_weight_cached_impl(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Runtime implementation for the opaque cached-weight custom op."""
+    key = (weight.data_ptr(), weight._version, tuple(weight.shape), weight.dtype)
+    cached = _weight_quant_cache.get(key)
+    if cached is not None:
+        _weight_quant_cache_stats["hit"] += 1
+        return cached
+    # Drop prior versions of this parameter before storing the new one.  This
+    # bounds host references and lets the allocator reclaim stale FP8 copies.
+    ptr = key[0]
+    stale = [k for k in _weight_quant_cache if k[0] == ptr and k != key]
+    for old_key in stale:
+        _weight_quant_cache.pop(old_key, None)
+    _weight_quant_cache_stats["miss"] += 1
+    out = _to_fp8(weight, torch.float8_e4m3fn)
+    _weight_quant_cache[key] = out
+    return out
+
+
+# Keep this operation opaque to AOTAutograd/Inductor so the Python cache check
+# runs again on every replay rather than only during graph tracing.
+_fp8_weight_quantize_cached = torch.library.custom_op(
+    "nanochat::fp8_weight_quantize_cached",
+    _quantize_weight_cached_impl,
+    mutates_args=(),
+)
+
+
+@_fp8_weight_quantize_cached.register_fake
+def _fp8_weight_quantize_cached_fake(weight):
+    return (
+        weight.new_empty(weight.shape, dtype=torch.float8_e4m3fn),
+        weight.new_empty((), dtype=torch.float32),
+    )
+
+
+def clear_fp8_weight_cache():
+    """Release packed weights after an optimizer update."""
+    _weight_quant_cache.clear()
+
+
 def _to_col_major(x):
     """Rearrange a 2D tensor's memory to column-major layout.
 
@@ -133,7 +191,7 @@ class _Float8Matmul(torch.autograd.Function):
     def forward(ctx, input_2d, weight):
         # Quantize both operands to e4m3 (higher precision format)
         input_fp8, input_inv = _to_fp8(input_2d, torch.float8_e4m3fn)
-        weight_fp8, weight_inv = _to_fp8(weight, torch.float8_e4m3fn)
+        weight_fp8, weight_inv = _fp8_weight_quantize_cached(weight)
         ctx.save_for_backward(input_fp8, input_inv, weight_fp8, weight_inv)
 
         # output = input @ weight.T
@@ -160,7 +218,7 @@ class _Float8Matmul(torch.autograd.Function):
         # === GEMM 1: grad_input = grad_output @ weight ===
         # Shapes: [B, N] @ [N, K] -> [B, K]
         # Gradients use e5m2 (wider range), weights use e4m3 (higher precision)
-        go_fp8, go_inv = _to_fp8(grad_output, torch.float8_e5m2)
+        go_fp8, go_inv = _to_fp8(grad_output, FP8_GRAD_DTYPE)
         # go_fp8 is [B, N] contiguous = row-major, good for first arg
         # w_fp8 is [N, K] contiguous = row-major, need column-major for second arg
         w_col = _to_col_major(w_fp8)
@@ -170,7 +228,7 @@ class _Float8Matmul(torch.autograd.Function):
             scale_a=go_inv,
             scale_b=w_inv,
             out_dtype=grad_output.dtype,
-            use_fast_accum=False,
+            use_fast_accum=FP8_FAST_ACCUM_BACKWARD,
         )
 
         # === GEMM 2: grad_weight = grad_output.T @ input ===
@@ -186,7 +244,7 @@ class _Float8Matmul(torch.autograd.Function):
             scale_a=go_inv,
             scale_b=in_inv,
             out_dtype=grad_output.dtype,
-            use_fast_accum=False,
+            use_fast_accum=FP8_FAST_ACCUM_BACKWARD,
         )
 
         return grad_input, grad_weight

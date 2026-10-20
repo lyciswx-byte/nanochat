@@ -50,6 +50,27 @@ class Linear(nn.Linear):
         return F.linear(x, self.weight.to(dtype=x.dtype))
 
 
+class FusedQKVLinear(Linear):
+    """One projection containing the Q, K, and V weights stacked by rows.
+
+    The fused projection has exactly the same parameter count and arithmetic as
+    three independent Linear layers.  It is enabled only by the NVFP4
+    optimization path; the default model keeps the original q/k/v modules so
+    existing checkpoints remain loadable.
+    """
+
+    def __init__(self, in_features, out_features, *, device=None, dtype=None):
+        super().__init__(in_features, out_features, bias=False, device=device, dtype=dtype)
+
+    @classmethod
+    def from_qkv(cls, q, k, v):
+        out_features, in_features = q.weight.shape[0] + k.weight.shape[0] + v.weight.shape[0], q.weight.shape[1]
+        fused = cls(in_features, out_features, device=q.weight.device, dtype=q.weight.dtype)
+        with torch.no_grad():
+            fused.weight.copy_(torch.cat((q.weight, k.weight, v.weight), dim=0))
+        return fused
+
+
 def has_ve(layer_idx, n_layer):
     """Returns True if GPT layer should have Value Embedding (alternating, last layer always included)."""
     return layer_idx % 2 == (n_layer - 1) % 2
@@ -75,6 +96,7 @@ class CausalSelfAttention(nn.Module):
         self.c_q = Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
         self.c_k = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+        self.c_qkv = None
         self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
@@ -84,9 +106,18 @@ class CausalSelfAttention(nn.Module):
 
         # Project the input to get queries, keys, and values
         # Shape: (B, T, H, D) - FA3's native layout, no transpose needed!
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+        if self.c_qkv is None:
+            q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
+            k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
+            v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+        else:
+            qkv = self.c_qkv(x)
+            q_width = self.n_head * self.head_dim
+            kv_width = self.n_kv_head * self.head_dim
+            q, k, v = qkv.split((q_width, kv_width, kv_width), dim=-1)
+            q = q.view(B, T, self.n_head, self.head_dim)
+            k = k.view(B, T, self.n_kv_head, self.head_dim)
+            v = v.view(B, T, self.n_kv_head, self.head_dim)
 
         # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
         if ve is not None:

@@ -87,8 +87,11 @@ set -e
 
 # --- Configuration (edit these for your setup) ---
 DEPTH="${DEPTH:-24}"
-DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-16}"  # 16 is safe (56 GB/GPU); 32 risks OOM on 128 GB UMA
+DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-16}"  # 16 stays below the 110 GB host-memory budget
 WINDOW_PATTERN="${WINDOW_PATTERN:-SSSL}"
+NVFP4="${NVFP4:-1}"          # native GB10 NVFP4 training; set 0 to fall back to FP8
+PRECISION_FLAG="--fp8"
+[ "$NVFP4" = "1" ] && PRECISION_FLAG="--nvfp4"
 TARGET_PARAM_DATA_RATIO="${TARGET_PARAM_DATA_RATIO:-8}"
 DATASET_SHARDS="${DATASET_SHARDS:-170}"
 NUM_ITERATIONS="${NUM_ITERATIONS:--1}"
@@ -98,8 +101,8 @@ CORE_METRIC_EVERY="${CORE_METRIC_EVERY:--1}"
 SAMPLE_EVERY="${SAMPLE_EVERY:--1}"
 
 # --- Bundle networking ---
-MASTER_ADDR="${MASTER_ADDR:-169.254.51.197}"
-RANK1_ADDR="${RANK1_ADDR:-169.254.123.70}"
+MASTER_ADDR="${MASTER_ADDR:-192.168.100.10}"
+RANK1_ADDR="${RANK1_ADDR:-192.168.100.11}"
 MASTER_PORT="${MASTER_PORT:-29500}"
 SYNC_PORT="${SYNC_PORT:-29501}"     # TCPStore port for between-stage sync (avoids torchrun's port)
 NCCL_IFNAME="${NCCL_IFNAME:-enp1s0f1np1}"
@@ -110,6 +113,11 @@ WANDB_RUN="${WANDB_RUN:-dummy}"
 RESUME_STEP="${RESUME_STEP:-}"
 STAGE="${STAGE:-all}"
 export OMP_NUM_THREADS=1
+export NANOCHAT_COMPILE_THREADS="${NANOCHAT_COMPILE_THREADS:-1}"
+# Keep native/Triton build helpers single threaded as well.  Inductor's Python
+# worker limit above is the main guard; this avoids a second compiler fan-out
+# from exhausting GB10's unified DRAM during the first NVFP4 build.
+export MAX_JOBS="${MAX_JOBS:-1}"
 export NCCL_SOCKET_IFNAME="$NCCL_IFNAME"
 export UCX_NET_DEVICES="$NCCL_IFNAME"
 # NVIDIA playbook-recommended NCCL settings for stacked Sparks.
@@ -120,6 +128,14 @@ export NCCL_IB_HCA="${NCCL_IB_HCA:-rocep1s0f0,rocep1s0f1,roceP2p1s0f0,roceP2p1s0
 export NCCL_IB_SUBNET_AWARE_ROUTING="${NCCL_IB_SUBNET_AWARE_ROUTING:-1}"
 export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-$HOME/.cache/nanochat}"
 mkdir -p "$NANOCHAT_BASE_DIR"
+# The Spark container is recreated after a reboot.  Keep the small tokenizer
+# wheels in the persistent nanochat cache so a fresh container can import them
+# without reinstalling into the image, and prepend that site directory when it
+# exists on both ranks.
+NANOCHAT_SITE_DIR="${NANOCHAT_SITE_DIR:-$NANOCHAT_BASE_DIR/site}"
+if [ -d "$NANOCHAT_SITE_DIR" ]; then
+    export PYTHONPATH="$NANOCHAT_SITE_DIR${PYTHONPATH:+:$PYTHONPATH}"
+fi
 
 # --- Helper: should we run this stage? ---
 should_run() { [ "$STAGE" = "all" ] || [ "$STAGE" = "$1" ]; }
@@ -152,7 +168,9 @@ echo "Node rank:      $NODE_RANK"
 echo "Depth:          $DEPTH"
 echo "Batch size:     $DEVICE_BATCH_SIZE"
 echo "Window pattern: $WINDOW_PATTERN"
-echo "FP8:            enabled"
+echo "Precision:      $([ "$NVFP4" = "1" ] && echo NVFP4 || echo FP8)"
+echo "Compile threads: $NANOCHAT_COMPILE_THREADS"
+echo "Compiler jobs:  $MAX_JOBS"
 echo "Stage:          $STAGE"
 echo "Wandb:          $WANDB_RUN"
 [ -n "$RESUME_STEP" ] && echo "Resume from:    step $RESUME_STEP"
@@ -172,7 +190,7 @@ echo "=============================================="
 # SSH options for checkpoint syncing inside the container.
 # -F /dev/null: skip ~/.ssh/config (owned by host user, rejected by root in container)
 # -i: use the NVIDIA discover-sparks shared key explicitly
-REMOTE_USER="${REMOTE_USER:-$USER}"
+REMOTE_USER="${REMOTE_USER:-lycis}"
 SSH_KEY="${SSH_KEY:-/root/.ssh/id_ed25519_shared}"
 SSH_OPTS="-F /dev/null -i $SSH_KEY -o ConnectTimeout=5 -o StrictHostKeyChecking=no"
 
@@ -248,7 +266,7 @@ if should_run "pretrain"; then
         --target-param-data-ratio="$TARGET_PARAM_DATA_RATIO" \
         --device-batch-size="$DEVICE_BATCH_SIZE" \
         --window-pattern="$WINDOW_PATTERN" \
-        --fp8 \
+        $PRECISION_FLAG \
         --run="$WANDB_RUN" \
         --save-every="$SAVE_EVERY" \
         --eval-every="$EVAL_EVERY" \
