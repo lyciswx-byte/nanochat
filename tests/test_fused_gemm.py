@@ -100,6 +100,16 @@ def test_forward_vs_bf16(m,n,k):
 
 
 @gb10
+def test_against_independent_torchao_scaled_mm_oracle():
+    """Catch wrong scale lane mapping, nibble order, or E2M1 decoding."""
+    from bench_fused_gemm import _baseline
+    a,b=_data(128,128,128)
+    actual=fused_gemm(a,b,scale_mode="exact")
+    expected=_baseline(a,b)
+    assert _nrmse(actual,expected)<0.07
+
+
+@gb10
 def test_static_equal_amax_matches_exact():
     a,b=_data(128,64,128)
     exact=fused_gemm(a,b,scale_mode="exact")
