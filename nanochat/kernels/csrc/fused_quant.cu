@@ -18,15 +18,22 @@ namespace cg = cooperative_groups;
 
 constexpr int TM = 128, TN = 64, THREADS = 256;
 
+// Do not silently mask NaNs: the base d24 NVFP4 run diverges after a
+// few steps, and the amax output must reflect that to make it diagnosable.
+__device__ __forceinline__ float max_nan(float a, float b) {
+    return (isnan(a) || isnan(b)) ? nanf("") : fmaxf(a, b);
+}
+
+
 __device__ __forceinline__ float block_max(float v, float *shared) {
     for (int d = 16; d; d >>= 1)
-        v = fmaxf(v, __shfl_down_sync(0xffffffff, v, d));
+        v = max_nan(v, __shfl_down_sync(0xffffffff, v, d));
     if ((threadIdx.x & 31) == 0) shared[threadIdx.x / 32] = v;
     __syncthreads();
     float w = threadIdx.x < (THREADS / 32) ? shared[threadIdx.x] : 0.0f;
     if (threadIdx.x < 32) {
         for (int d = 16; d; d >>= 1)
-            w = fmaxf(w, __shfl_down_sync(0xffffffff, w, d));
+            w = max_nan(w, __shfl_down_sync(0xffffffff, w, d));
     }
     if (threadIdx.x == 0) shared[0] = w;
     __syncthreads();
@@ -98,7 +105,7 @@ quant_coop(const __nv_bfloat16 *__restrict__ x, int M, int N,
             for (int j = tid; j < N; j += THREADS) {
                 float v = __bfloat162float(x[int64_t(row_id) * N + j]);
                 sum_sq += v * v;
-                max_abs = fmaxf(max_abs, fabsf(v));
+                max_abs = max_nan(max_abs, fabsf(v));
             }
             float total = block_sum(sum_sq, reduce_s);
             float amax_row = block_max(max_abs, reduce_s);
@@ -106,7 +113,7 @@ quant_coop(const __nv_bfloat16 *__restrict__ x, int M, int N,
             if (tid == 0) row_rstd[row_id] = rs;
             // BF16 rounding is monotone, so round(max*rs) == max(round(x*rs)).
             float y = fabsf(__bfloat162float(__float2bfloat16_rn(amax_row * rs)));
-            local = fmaxf(local, y);
+            local = max_nan(local, y);
         }
     } else {
         for (int64_t i = int64_t(blockIdx.x) * THREADS + tid; i < numel;
@@ -116,7 +123,7 @@ quant_coop(const __nv_bfloat16 *__restrict__ x, int M, int N,
                 float relu = fmaxf(v, 0.0f);
                 v = __bfloat162float(__float2bfloat16_rn(relu * relu));
             }
-            local = fmaxf(local, fabsf(v));
+            local = max_nan(local, fabsf(v));
         }
     }
     float block_amax = block_max(local, reduce_s);
@@ -126,7 +133,7 @@ quant_coop(const __nv_bfloat16 *__restrict__ x, int M, int N,
     if (blockIdx.x == 0) {
         float m = 0.0f;
         for (int j = tid; j < gridDim.x; j += THREADS)
-            m = fmaxf(m, partial[j]);
+            m = max_nan(m, partial[j]);
         m = block_max(m, reduce_s);
         if (tid == 0) *output_amax = m;
     }
@@ -174,10 +181,10 @@ quant_coop(const __nv_bfloat16 *__restrict__ x, int M, int N,
             for (int k = lane; k < 256; k += 32) {
                 float v = __bfloat162float(
                     tile[(r0 + k / 16) * TN + c0 + (k % 16)]);
-                vmax = fmaxf(vmax, fabsf(v));
+                vmax = max_nan(vmax, fabsf(v));
             }
             for (int d = 16; d; d >>= 1)
-                vmax = fmaxf(vmax, __shfl_down_sync(0xffffffff, vmax, d));
+                vmax = max_nan(vmax, __shfl_down_sync(0xffffffff, vmax, d));
             vmax = __shfl_sync(0xffffffff, vmax, 0);
 
             unsigned int sf = 0;
