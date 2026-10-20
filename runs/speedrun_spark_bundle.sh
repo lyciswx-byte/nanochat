@@ -91,7 +91,7 @@ DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-16}"  # 16 stays below the 110 GB host-m
 WINDOW_PATTERN="${WINDOW_PATTERN:-SSSL}"
 NVFP4="${NVFP4:-1}"          # native GB10 NVFP4 training; set 0 to fall back to FP8
 PRECISION_FLAG="--fp8"
-[ "$NVFP4" = "1" ] && PRECISION_FLAG="--nvfp4"
+[ "$NVFP4" = "1" ] && PRECISION_FLAG="--nvfp4 --nvfp4-fuse-qkv"
 TARGET_PARAM_DATA_RATIO="${TARGET_PARAM_DATA_RATIO:-8}"
 DATASET_SHARDS="${DATASET_SHARDS:-170}"
 NUM_ITERATIONS="${NUM_ITERATIONS:--1}"

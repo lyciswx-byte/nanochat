@@ -179,6 +179,13 @@ resuming = args.resume_from_step != -1
 if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
+    # A fused NVFP4 run stores one c_qkv parameter per attention block. Build
+    # that shape before loading so a restarted run can consume its checkpoint;
+    # checkpoints written before fusion still load through the original Q/K/V
+    # modules and are fused immediately afterwards below.
+    if args.nvfp4_fuse_qkv and any(".attn.c_qkv.weight" in k for k in model_data):
+        from nanochat.nvfp4 import fuse_qkv_projections
+        fuse_qkv_projections(model)
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
 
