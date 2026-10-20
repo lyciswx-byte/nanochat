@@ -168,8 +168,89 @@ def _install_weight_quant_cache():
     nvfp4_linear._nanochat_weight_cache = True
 
 
+# ---------------------------------------------------------------------------
+# Stable BF16 view of the FP32 master weight
+# ---------------------------------------------------------------------------
+# ``nvfp4_mm_triton.forward`` casts a non-BF16 weight with ``weight.to(bf16)``.
+# Training keeps FP32 master weights, so that cast materialises a brand new
+# tensor on every micro-step; the cached weight quantizer then sees a different
+# storage each call and rebuilds the quantized weight from scratch (measured:
+# only ~40% of lookups hit, and the cache grows by a full model copy per
+# micro-step).  Route the cast through an opaque cached op so the quantizer sees
+# one stable BF16 tensor per optimizer step while autograd still delivers the
+# gradient to the FP32 parameter.
+_bf16_cast_cache: dict = {}
+
+
+@torch.no_grad()
+def _cached_bf16_cast_impl(w: torch.Tensor) -> torch.Tensor:
+    if w.dtype == torch.bfloat16:
+        return w
+    key = (w.data_ptr(), w._version, tuple(w.shape))
+    hit = _bf16_cast_cache.get(key)
+    if hit is not None:
+        return hit
+    ptr = key[0]
+    for old_key in [k for k in _bf16_cast_cache if k[0] == ptr and k != key]:
+        _bf16_cast_cache.pop(old_key, None)
+    out = w.to(torch.bfloat16)
+    _bf16_cast_cache[key] = out
+    return out
+
+
+_cached_bf16_cast = torch.library.custom_op(
+    "nanochat::bf16_cast_cached", _cached_bf16_cast_impl, mutates_args=()
+)
+
+
+@_cached_bf16_cast.register_fake
+def _cached_bf16_cast_fake(w: torch.Tensor) -> torch.Tensor:
+    return w.new_empty(w.shape, dtype=torch.bfloat16)
+
+
+class _CachedBf16Weight(torch.autograd.Function):
+    """Return the cached BF16 weight while routing gradients to the FP32 master."""
+
+    @staticmethod
+    def forward(ctx, weight):
+        return _cached_bf16_cast(weight)
+
+    @staticmethod
+    def backward(ctx, grad):
+        return grad.to(torch.float32)
+
+
+def _install_cached_weight_cast():
+    import torchao.prototype.moe_training.nvfp4_training.nvfp4_training as nvfp4_training
+    from torchao.prototype.moe_training.nvfp4_training.nvfp4_linear import (
+        nvfp4_linear as _nvfp4_linear_fn,
+    )
+
+    cls = nvfp4_training.NVFP4Linear
+    if getattr(cls, "_nanochat_cached_cast", False):
+        return
+    orig_forward = cls.forward
+
+    def forward(self, x):
+        if self.process_group is not None or self.weight.dtype == torch.bfloat16:
+            return orig_forward(self, x)
+        weight = _CachedBf16Weight.apply(self.weight)
+        return _nvfp4_linear_fn(
+            x,
+            weight,
+            self.bias,
+            kernel_preference=self.kernel_preference,
+            sr_seed=self._sr_seed,
+            sign_vector=self.rht_sign_vector,
+        )
+
+    cls.forward = forward
+    cls._nanochat_cached_cast = True
+
+
 def invalidate_weight_cache():
     _wq_cache.clear()
+    _bf16_cast_cache.clear()
 
 
 def _use_plain_quantization():
@@ -192,15 +273,7 @@ def _use_plain_quantization():
         # full tensor pass without changing the scale at useful precision.
         # Keep an opt-out for precision experiments; BF16 reduction is the
         # fast default on GB10.
-        static_amax = os.environ.get("NANOCHAT_NVFP4_STATIC_AMAX", "")
-        if static_amax:
-            # The block scale still adapts per 16 values; this only fixes the
-            # outer NVFP4 tensor scale and removes a reduction kernel. It is an
-            # opt-in experiment because activation tails can vary by layer.
-            amax = torch.full(
-                (), float(static_amax), device=x.device, dtype=torch.float32
-            )
-        elif use_cutedsl or os.environ.get("NANOCHAT_NVFP4_AMAX_FP32", "0") == "1":
+        if use_cutedsl or os.environ.get("NANOCHAT_NVFP4_AMAX_FP32", "0") == "1":
             amax = x.float().abs().max()
         else:
             amax = x.abs().amax()
@@ -408,6 +481,7 @@ def convert_to_nvfp4_training(
     if not use_rht:
         _use_plain_quantization()
     _install_weight_quant_cache()
+    _install_cached_weight_cast()
     if os.environ.get("NANOCHAT_NVFP4_FAST_ACCUM", "0") == "1":
         _install_fast_accum_scaled_mm()
     if os.environ.get("NANOCHAT_NVFP4_GEMM", "torchao").lower() == "quack":
