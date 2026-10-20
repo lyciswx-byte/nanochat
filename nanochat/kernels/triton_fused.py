@@ -274,10 +274,15 @@ def _(x, residual, global_amax, eps):
 @torch.library.custom_op("nanochat::triton_rmsnorm_backward", mutates_args=())
 def _rms_bwd_op(x: torch.Tensor, residual: torch.Tensor, grad_normalized: torch.Tensor,
                 rstd: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    if grad_normalized.shape != x.shape or grad_normalized.dtype != x.dtype:
-        raise ValueError("grad_normalized must match x")
-    if rstd.shape != (x.shape[0],) or rstd.dtype != torch.float32:
-        raise ValueError("rstd must be float32 [M]")
+    if (x.ndim != 2 or residual.shape != x.shape or
+        residual.dtype != x.dtype or x.dtype != torch.bfloat16 or
+        not x.is_contiguous() or not residual.is_contiguous()):
+        raise ValueError("x and residual must be contiguous BF16 [M,K]")
+    if (grad_normalized.shape != x.shape or grad_normalized.dtype != x.dtype
+        or not grad_normalized.is_contiguous()):
+        raise ValueError("grad_normalized must be contiguous BF16 matching x")
+    if rstd.shape != (x.shape[0],) or rstd.dtype != torch.float32 or not rstd.is_contiguous():
+        raise ValueError("rstd must be contiguous float32 [M]")
     if x.device != residual.device or x.device != grad_normalized.device or x.device != rstd.device:
         raise ValueError("all inputs must share device")
     dx = torch.empty_like(x)
@@ -296,8 +301,14 @@ def _(x, residual, grad_normalized, rstd):
 @torch.library.custom_op("nanochat::triton_rstd_vjp", mutates_args=())
 def _rstd_vjp_op(x: torch.Tensor, residual: torch.Tensor, rstd: torch.Tensor,
                  grad_rstd: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    if grad_rstd.shape != rstd.shape:
-        raise ValueError("grad_rstd must have the same shape as rstd")
+    if (x.ndim != 2 or x.dtype != torch.bfloat16 or residual.shape != x.shape
+        or not x.is_contiguous() or not residual.is_contiguous()):
+        raise ValueError("x and residual must be contiguous BF16 [M,K]")
+    if (rstd.shape != (x.shape[0],) or rstd.dtype != torch.float32
+        or grad_rstd.shape != rstd.shape or grad_rstd.dtype != rstd.dtype):
+        raise ValueError("rstd and grad_rstd must both be FP32 [M]")
+    if x.device != residual.device or x.device != rstd.device or x.device != grad_rstd.device:
+        raise ValueError("all VJP inputs must share device")
     dx, dr = torch.empty_like(x), torch.empty_like(residual)
     _rstd_vjp_kernel[(x.shape[0],)](
         x, residual, rstd, grad_rstd.contiguous(), dx, dr,
