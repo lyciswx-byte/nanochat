@@ -304,6 +304,120 @@ def _use_plain_quantization():
     nvfp4_linear._rht_quantize_row_col = _plain_quantize
 
 
+
+def _install_fused_activation_quantizer() -> None:
+    """Replace the plain torchao activation quantize/amax *pair* as one op.
+
+    Patching only _rht_quantize_row_col is not useful: _rht_amax would still
+    traverse the entire input. Replacing the autograd Function eliminates that
+    traversal in both forward and backward, preserving the three torchao GEMMs.
+    This is intentionally for plain quantization only (not RHT).
+    """
+    import torchao.prototype.moe_training.nvfp4_training.nvfp4_linear as nv
+    from nanochat.kernels.fused_quant import fused_quantize, prewarm
+
+    if getattr(nv, "_nanochat_fused_activation", False):
+        return
+    prewarm()
+
+    def _gemm(a, b, a_sf, a_amax, b_sf, b_amax):
+        af = torch.float4_e2m1fn_x2
+        F = nv.F
+        return F.scaled_mm(
+            a.view(af), b.view(af).t(),
+            scale_a=[a_sf.flatten(), nv.per_tensor_amax_to_scale(a_amax)],
+            scale_recipe_a=[F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
+            scale_b=[b_sf.flatten(), nv.per_tensor_amax_to_scale(b_amax)],
+            scale_recipe_b=[F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
+            swizzle_a=[F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
+            swizzle_b=[F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
+            output_dtype=torch.bfloat16,
+        )
+
+    class _FusedNvfp4Matmul(torch.autograd.Function):
+        @staticmethod
+        def forward(
+            ctx, input_hp, weight_hp, bias, sr_seed, sign_vector,
+            use_cutedsl=False, use_fast_math=True,
+        ):
+            if input_hp.dtype != torch.bfloat16:
+                input_hp = input_hp.to(torch.bfloat16)
+            if weight_hp.dtype != torch.bfloat16:
+                weight_hp = weight_hp.to(torch.bfloat16)
+            K, N = input_hp.shape[-1], weight_hp.shape[0]
+            M = input_hp.numel() // K
+            if M % 128 or K % 128 or N % 128:
+                raise ValueError("fused NVFP4 linear requires M/K/N multiples of 128")
+            x = input_hp.reshape(-1, K).contiguous()
+            x_row, x_row_sf, x_col, x_col_sf, x_amax = fused_quantize(x)
+            W_row, W_sf, W_gs, W_col, W_col_sf, W_amax = (
+                nv._weight_quantize_2d(weight_hp, use_cutedsl)
+            )
+            # Weight codes are already float4_x2, unlike our uint8 activation codes.
+            F = nv.F
+            out = F.scaled_mm(
+                x_row.view(torch.float4_e2m1fn_x2),
+                W_row.t(),
+                scale_a=[x_row_sf.flatten(), nv.per_tensor_amax_to_scale(x_amax)],
+                scale_recipe_a=[F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
+                scale_b=[W_sf.flatten(), W_gs],
+                scale_recipe_b=[F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
+                swizzle_a=[F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
+                swizzle_b=[F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
+                output_dtype=torch.bfloat16,
+            )
+            out = out.reshape(*input_hp.shape[:-1], N)
+            if bias is not None:
+                out = out + bias
+            ctx.save_for_backward(
+                x_col, x_col_sf, x_amax, W_col, W_col_sf, W_amax
+            )
+            ctx.input_orig_shape = input_hp.shape
+            ctx.has_bias = bias is not None
+            return out
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            x_col, x_col_sf, x_amax, W_col, W_col_sf, W_amax = ctx.saved_tensors
+            dy = grad_output.contiguous().reshape(-1, grad_output.shape[-1])
+            dy_row, dy_row_sf, dy_col, dy_col_sf, dy_amax = fused_quantize(dy)
+            # Grad input: dy_row @ W_col.T
+            F = nv.F
+            dinput = F.scaled_mm(
+                dy_row.view(torch.float4_e2m1fn_x2), W_col.t(),
+                scale_a=[dy_row_sf.flatten(), nv.per_tensor_amax_to_scale(dy_amax)],
+                scale_recipe_a=[F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
+                scale_b=[
+                    W_col_sf.flatten(), nv.per_tensor_amax_to_scale(W_amax)
+                ],
+                scale_recipe_b=[F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
+                swizzle_a=[F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
+                swizzle_b=[F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
+                output_dtype=torch.bfloat16,
+            ).reshape(ctx.input_orig_shape)
+            # Weight gradient: dy_col @ x_col.T. Here the orientation matches
+            # the torchao RHT/plain backward's colwise packed quantization.
+            dweight = F.scaled_mm(
+                dy_col.view(torch.float4_e2m1fn_x2),
+                x_col.view(torch.float4_e2m1fn_x2).t(),
+                scale_a=[dy_col_sf.flatten(), nv.per_tensor_amax_to_scale(dy_amax)],
+                scale_recipe_a=[F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
+                scale_b=[x_col_sf.flatten(), nv.per_tensor_amax_to_scale(x_amax)],
+                scale_recipe_b=[F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
+                swizzle_a=[F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
+                swizzle_b=[F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
+                output_dtype=torch.bfloat16,
+            )
+            dbias = (
+                grad_output.sum(dim=tuple(range(grad_output.dim() - 1)))
+                if ctx.has_bias else None
+            )
+            return dinput, dweight, dbias, None, None, None, None
+
+    nv.nvfp4_matmul = _FusedNvfp4Matmul
+    nv._nanochat_fused_activation = True
+
+
 def _install_quack_scaled_mm():
     """Use Quack's SM120/121 block-scaled MMA for torchao's three GEMMs.
 
@@ -471,6 +585,10 @@ def convert_to_nvfp4_training(
     _install_fast_weight_quantizer()
     if not use_rht:
         _use_plain_quantization()
+    if os.environ.get("NANOCHAT_NVFP4_FUSED_QUANT", "0") == "1":
+        if use_rht:
+            raise ValueError("fused activation quantizer currently supports plain mode only")
+        _install_fused_activation_quantizer()
     # The cached quantizer returns clones of the packed weights (see
     # ``_cached_impl``), so Inductor owns every tensor it may donate.
     if os.environ.get("NANOCHAT_NVFP4_CACHE_WEIGHTS", "1") == "1":
