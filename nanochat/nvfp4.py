@@ -143,13 +143,18 @@ def _install_weight_quant_cache():
         hit = _wq_cache.get(key)
         if hit is not None:
             _wq_stats["hit"] += 1
-            return hit
-        _wq_stats["miss"] += 1
-        out = orig(x, use_cutedsl)
-        if len(_wq_cache) >= 1024:
-            _wq_cache.clear()
-        _wq_cache[key] = out
-        return out
+        else:
+            _wq_stats["miss"] += 1
+            hit = orig(x, use_cutedsl)
+            if len(_wq_cache) >= 1024:
+                _wq_cache.clear()
+            _wq_cache[key] = hit
+        # Inductor owns custom-op outputs and may donate/free their storage.
+        # Returning the cached tensors themselves lets it overwrite the packed
+        # weights (verified corruption: loss 10.40 -> 24.81 on replay). Hand
+        # back fresh allocations; cloning ~0.7 GB per micro-step is far cheaper
+        # than re-running the quantizer over every weight.
+        return tuple(t.clone() for t in hit)
 
     # Opaque custom op: without this, AOTAutograd traces the autograd.Function
     # and inlines the quantize into the compiled graph, so the cache check never
@@ -169,75 +174,49 @@ def _install_weight_quant_cache():
 
 
 # ---------------------------------------------------------------------------
-# Stable BF16 view of the FP32 master weight
+# Stable BF16 shadow buffer for the FP32 master weight
 # ---------------------------------------------------------------------------
 # ``nvfp4_mm_triton.forward`` casts a non-BF16 weight with ``weight.to(bf16)``.
-# Training keeps FP32 master weights, so that cast materialises a brand new
-# tensor on every micro-step; the cached weight quantizer then sees a different
-# storage each call and rebuilds the quantized weight from scratch (measured:
-# only ~40% of lookups hit, and the cache grows by a full model copy per
-# micro-step).  Route the cast through an opaque cached op so the quantizer sees
-# one stable BF16 tensor per optimizer step while autograd still delivers the
-# gradient to the FP32 parameter.
-_bf16_cast_cache: dict = {}
+# Training keeps FP32 master weights, so that cast materialises a fresh tensor
+# on every micro-step and the cached weight quantizer never hits. A registered
+# non-persistent BF16 buffer is a stable graph input: the quantizer sees the
+# same storage across micro-steps, while ``refresh_nvfp4_weight_shadows`` copies
+# the new master value once after each optimizer update. The buffer is never
+# returned as an ephemeral cache entry, so Inductor cannot reuse its storage.
+_W_SHADOW = "_nanochat_bf16_weight"
 
 
-@torch.no_grad()
-def _cached_bf16_cast_impl(w: torch.Tensor) -> torch.Tensor:
-    if w.dtype == torch.bfloat16:
-        return w
-    key = (w.data_ptr(), w._version, tuple(w.shape))
-    hit = _bf16_cast_cache.get(key)
-    if hit is not None:
-        return hit
-    ptr = key[0]
-    for old_key in [k for k in _bf16_cast_cache if k[0] == ptr and k != key]:
-        _bf16_cast_cache.pop(old_key, None)
-    out = w.to(torch.bfloat16)
-    _bf16_cast_cache[key] = out
-    return out
-
-
-_cached_bf16_cast = torch.library.custom_op(
-    "nanochat::bf16_cast_cached", _cached_bf16_cast_impl, mutates_args=()
-)
-
-
-@_cached_bf16_cast.register_fake
-def _cached_bf16_cast_fake(w: torch.Tensor) -> torch.Tensor:
-    return w.new_empty(w.shape, dtype=torch.bfloat16)
-
-
-class _CachedBf16Weight(torch.autograd.Function):
-    """Return the cached BF16 weight while routing gradients to the FP32 master."""
+class _ShadowBf16Weight(torch.autograd.Function):
+    """Forward uses the stable BF16 shadow; backward returns FP32 master grads."""
 
     @staticmethod
-    def forward(ctx, weight):
-        return _cached_bf16_cast(weight)
+    def forward(ctx, master: torch.Tensor, shadow: torch.Tensor):
+        ctx.master_dtype = master.dtype
+        return shadow
 
     @staticmethod
-    def backward(ctx, grad):
-        return grad.to(torch.float32)
+    def backward(ctx, grad: torch.Tensor):
+        return grad.to(ctx.master_dtype), None
 
 
-def _install_cached_weight_cast():
+def _install_weight_shadow_forward():
     import torchao.prototype.moe_training.nvfp4_training.nvfp4_training as nvfp4_training
     from torchao.prototype.moe_training.nvfp4_training.nvfp4_linear import (
         nvfp4_linear as _nvfp4_linear_fn,
     )
 
     cls = nvfp4_training.NVFP4Linear
-    if getattr(cls, "_nanochat_cached_cast", False):
+    if getattr(cls, "_nanochat_shadow_forward", False):
         return
     orig_forward = cls.forward
 
     def forward(self, x):
-        if self.process_group is not None or self.weight.dtype == torch.bfloat16:
+        shadow = getattr(self, _W_SHADOW, None)
+        if shadow is None or self.process_group is not None:
             return orig_forward(self, x)
-        weight = _CachedBf16Weight.apply(self.weight)
         return _nvfp4_linear_fn(
             x,
-            weight,
+            _ShadowBf16Weight.apply(self.weight, shadow),
             self.bias,
             kernel_preference=self.kernel_preference,
             sr_seed=self._sr_seed,
@@ -245,12 +224,20 @@ def _install_cached_weight_cast():
         )
 
     cls.forward = forward
-    cls._nanochat_cached_cast = True
+    cls._nanochat_shadow_forward = True
+
+
+@torch.no_grad()
+def refresh_nvfp4_weight_shadows(model: nn.Module) -> None:
+    """Copy the FP32 masters into their BF16 shadows after an optimizer step."""
+    for module in model.modules():
+        shadow = getattr(module, _W_SHADOW, None)
+        if shadow is not None:
+            shadow.copy_(module.weight)
 
 
 def invalidate_weight_cache():
     _wq_cache.clear()
-    _bf16_cast_cache.clear()
 
 
 def _use_plain_quantization():
@@ -276,7 +263,11 @@ def _use_plain_quantization():
         if use_cutedsl or os.environ.get("NANOCHAT_NVFP4_AMAX_FP32", "0") == "1":
             amax = x.float().abs().max()
         else:
-            amax = x.abs().amax()
+            # ``x.abs().amax()`` materialises a full-size absolute-value tensor
+            # in eager mode (three passes over the activation). The infinity
+            # norm is a single fused reduction and measures ~3x faster for the
+            # same value; torch.compile keeps it as one reduction kernel.
+            amax = torch.linalg.vector_norm(x, ord=float("inf"))
         return amax, amax
 
     def _plain_quantize(
@@ -480,8 +471,13 @@ def convert_to_nvfp4_training(
     _install_fast_weight_quantizer()
     if not use_rht:
         _use_plain_quantization()
-    _install_weight_quant_cache()
-    _install_cached_weight_cast()
+    # The cached quantizer returns clones of the packed weights (see
+    # ``_cached_impl``), so Inductor owns every tensor it may donate.
+    if os.environ.get("NANOCHAT_NVFP4_CACHE_WEIGHTS", "1") == "1":
+        _install_weight_quant_cache()
+    shadow_enabled = os.environ.get("NANOCHAT_NVFP4_WEIGHT_SHADOW", "1") == "1"
+    if shadow_enabled:
+        _install_weight_shadow_forward()
     if os.environ.get("NANOCHAT_NVFP4_FAST_ACCUM", "0") == "1":
         _install_fast_accum_scaled_mm()
     if os.environ.get("NANOCHAT_NVFP4_GEMM", "torchao").lower() == "quack":
@@ -529,5 +525,12 @@ def convert_to_nvfp4_training(
             # Keep checkpoints byte-compatible with a plain GPT state_dict:
             # the RHT seed/basis are run-local, not model weights.
             mod._non_persistent_buffers_set.update({"_sr_seed", "_rht_sign_vector"})
+            if shadow_enabled and mod.process_group is None and mod.weight.dtype != torch.bfloat16:
+                if getattr(mod, _W_SHADOW, None) is None:
+                    mod.register_buffer(
+                        _W_SHADOW,
+                        mod.weight.detach().to(torch.bfloat16).clone(),
+                        persistent=False,
+                    )
             n += 1
     return n

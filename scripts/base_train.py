@@ -232,6 +232,9 @@ if args.nvfp4:
             print0(f"✓ Fused QKV projections in {num_fused_qkv} attention layers")
         num_linear = sum(1 for m in model.modules() if isinstance(m, torch.nn.Linear))
         num_nvfp4 = convert_to_nvfp4_training(model, use_rht=args.nvfp4_rht)
+        if os.environ.get("NANOCHAT_NVFP4_WEIGHT_SHADOW", "1") == "1":
+            from nanochat.nvfp4 import refresh_nvfp4_weight_shadows
+            refresh_nvfp4_weight_shadows(model)
         print0(f"✓ NVFP4 training enabled (sm_121a, RTNE backward, RHT={args.nvfp4_rht}) - converted {num_nvfp4}/{num_linear} linear layers")
 
 # Context manager to temporarily disable low-precision Linears so that model
@@ -619,8 +622,10 @@ while True:
         from nanochat.fp8 import clear_fp8_weight_cache
         clear_fp8_weight_cache()
     if args.nvfp4:
-        # Weights changed in optimizer.step(); drop the cached NVFP4 weights.
-        from nanochat.nvfp4 import invalidate_weight_cache
+        # Weights changed in optimizer.step(); refresh the stable BF16 shadows
+        # and drop the cached quantized copies.
+        from nanochat.nvfp4 import invalidate_weight_cache, refresh_nvfp4_weight_shadows
+        refresh_nvfp4_weight_shadows(orig_model)
         invalidate_weight_cache()
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()
