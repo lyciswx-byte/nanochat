@@ -203,9 +203,13 @@ def capture_layer_inputs(model, seed: int):
     }
     hooks = []
     for name, module in modules.items():
-        hooks.append(module.register_forward_pre_hook(
-            lambda _m, inp, key=name: seen.setdefault(key, inp[0].detach().reshape(-1, 1536).contiguous().clone())
-        ))
+        def save_input(_module, inp, *, key=name):
+            if key not in seen:
+                seen[key] = inp[0].detach().reshape(-1, 1536).contiguous().clone()
+            # Returning None is essential: a pre-hook return value REPLACES the
+            # live model input and would change its 3D shape to a 2D replay tile.
+            return None
+        hooks.append(module.register_forward_pre_hook(save_input))
     try:
         rng = torch.Generator(device="cuda").manual_seed(seed + 1)
         tokens = torch.randint(0, model.config.vocab_size, (16, 2048),
@@ -227,15 +231,24 @@ def _schedule_pair(gemm, quant, quant_stream, dependent: bool):
     quant_done = torch.cuda.Event(enable_timing=False)
     finish = torch.cuda.Event(enable_timing=True)
     begin.record(origin)
-    # Each input was produced before begin. ready event means both can read it.
-    with torch.cuda.stream(quant_stream):
-        quant_stream.wait_event(begin)
-        if dependent:
+    if dependent:
+        # MUST record gemm_done BEFORE asking another stream to wait on it.
+        # CUDA waits on never-recorded events are not a real dependency!
+        gemm()
+        gemm_done.record(origin)
+        with torch.cuda.stream(quant_stream):
             quant_stream.wait_event(gemm_done)
-        quant()
-        quant_done.record(quant_stream)
-    gemm()
-    gemm_done.record(origin)
+            quant()
+            quant_done.record(quant_stream)
+    else:
+        # Both inputs were independently captured earlier; this is upper-bound
+        # replay, not a live cross-layer forward pass.
+        with torch.cuda.stream(quant_stream):
+            quant_stream.wait_event(begin)
+            quant()
+            quant_done.record(quant_stream)
+        gemm()
+        gemm_done.record(origin)
     origin.wait_event(quant_done)
     finish.record(origin)
     return finish, begin
