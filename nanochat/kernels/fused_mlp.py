@@ -78,6 +78,7 @@ def _scaled_mm(a, asf, a_amax, b, bsf, b_amax, b_is_tensor_scale=False):
     )
 
 
+@torch._dynamo.allow_in_graph
 class _ReLU2NVFP4Linear(torch.autograd.Function):
     @staticmethod
     def forward(ctx, fc1_output, master_weight, shadow):
