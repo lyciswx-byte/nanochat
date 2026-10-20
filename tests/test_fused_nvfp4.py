@@ -40,6 +40,53 @@ def test_plain_exact(shape, kind):
         assert torch.equal(a, b), f"mismatch at output {idx}, shape={shape}, kind={kind}"
 
 
+@pytest.mark.parametrize("shape", [(128, 128), (1024, 1536)])
+def test_zero_scale_atoms_at_swizzle_boundaries(shape):
+    # An all-zero 16x16 block must store literal E4M3 +0. The two corner
+    # blocks land at opposite ends of torchao's 32x16 swizzled SF storage.
+    x = torch.ones(shape, device="cuda", dtype=torch.bfloat16)
+    x[:16, :16] = 0
+    x[-16:, -16:] = 0
+    reference = torchao_plain_reference(x)
+    fused = fused_quantize(x)
+    for idx in (1, 3):
+        expected = reference[idx].view(torch.uint8).flatten()
+        actual = fused[idx].view(torch.uint8).flatten()
+        assert int(expected[0]) == int(expected[-1]) == 0
+        assert int(actual[0]) == int(actual[-1]) == 0
+        assert torch.equal(actual, expected), f"scale bytes at output {idx}"
+    for idx in (0, 2):
+        assert torch.equal(fused[idx], reference[idx]), f"packed bytes at output {idx}"
+
+
+def test_fused_switches_default_off_and_validate_inputs(monkeypatch):
+    from nanochat.kernels.fused_quant import enabled as quant_enabled
+    from nanochat.kernels.fused_rmsnorm import enabled as norm_enabled
+    from nanochat.kernels.fused_mlp import enabled as mlp_enabled
+    flags = (
+        "NANOCHAT_NVFP4_FUSED_QUANT",
+        "NANOCHAT_NVFP4_FUSED_RMSNORM",
+        "NANOCHAT_NVFP4_FUSED_MLP",
+    )
+    for flag in flags:
+        monkeypatch.delenv(flag, raising=False)
+    assert not any(fn() for fn in (quant_enabled, norm_enabled, mlp_enabled))
+    for flag in flags:
+        monkeypatch.setenv(flag, "true")  # only literal \"1\" opts in
+    assert not any(fn() for fn in (quant_enabled, norm_enabled, mlp_enabled))
+    for flag in flags:
+        monkeypatch.setenv(flag, "1")
+    assert all(fn() for fn in (quant_enabled, norm_enabled, mlp_enabled))
+
+    invalid_shape = torch.empty((128, 129), device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="multiples of 128"):
+        fused_quantize(invalid_shape)
+    with pytest.raises(ValueError, match="multiples of 128"):
+        fused_rmsnorm_quant(invalid_shape, 1e-5)
+    with pytest.raises(ValueError, match="128"):
+        fused_relu2_quant(invalid_shape)
+
+
 @pytest.mark.parametrize("shape", [(128, 128), (128, 256), (1024, 1536)])
 def test_norm_and_relu_correctness(shape):
     torch.manual_seed(6)
