@@ -25,8 +25,10 @@ def _fake(x: torch.Tensor, return_bf16: bool = False) -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor,
     torch.Tensor, torch.Tensor, torch.Tensor
 ]:
-    if x.ndim != 2 or x.dtype != torch.bfloat16 or x.shape[0] % 128 or x.shape[1] % 128:
-        raise ValueError("requires M,N %128==0 contiguous 2D BF16")
+    if (x.ndim != 2 or x.dtype != torch.bfloat16 or x.shape[0] % 128
+            or x.shape[1] % 128 or not x.is_contiguous()
+            or x.device.type != "cuda"):
+        raise ValueError("requires M,N %128==0 contiguous CUDA 2D BF16")
     m, n = x.shape
     return (
         x.new_empty((m, n // 2), dtype=torch.uint8),
