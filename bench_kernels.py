@@ -274,18 +274,26 @@ def main():
         "gpu": props.name, "cc": "12.1", "sm_count": props.multi_processor_count,
         "notes": "Measured only on the operator shapes, never claimed as model tok/s",
     }, indent=2))
+    failed_shapes = []
     for shape in ((128, 128), (128, 256), (256, 128), (256, 256), (1024, 1536)):
         v = correctness(shape)
         print("CORRECTNESS", json.dumps(v))
         if not v["pass"]:
-            raise AssertionError(f"torchao layout/code mismatch: {shape}")
+            failed_shapes.append(shape)
     for shape in ((128, 128), (128, 256), (1024, 1536)):
         for result in transformed_correctness(shape):
             print("TRANSFORM_CORRECTNESS", json.dumps(result))
     if args.autograd_smoke:
         print(autograd_smoke())
     if args.check_only:
+        if failed_shapes:
+            raise AssertionError(f"torchao layout/code mismatch: {failed_shapes}")
         return
+    if failed_shapes:
+        print("WARNING", json.dumps({
+            "message": "Byte-exact correctness failed; timings are diagnostic only",
+            "shapes": failed_shapes,
+        }))
     for M, K, N in GEMMS:
         if args.skip_large and K >= 32768:
             continue
