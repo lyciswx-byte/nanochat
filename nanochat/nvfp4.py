@@ -314,25 +314,10 @@ def _install_fused_activation_quantizer() -> None:
     This is intentionally for plain quantization only (not RHT).
     """
     import torchao.prototype.moe_training.nvfp4_training.nvfp4_linear as nv
-    from nanochat.kernels.fused_quant import fused_quantize, prewarm
+    from nanochat.kernels.fused_quant import fused_quantize
 
     if getattr(nv, "_nanochat_fused_activation", False):
         return
-    prewarm()
-
-    def _gemm(a, b, a_sf, a_amax, b_sf, b_amax):
-        af = torch.float4_e2m1fn_x2
-        F = nv.F
-        return F.scaled_mm(
-            a.view(af), b.view(af).t(),
-            scale_a=[a_sf.flatten(), nv.per_tensor_amax_to_scale(a_amax)],
-            scale_recipe_a=[F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
-            scale_b=[b_sf.flatten(), nv.per_tensor_amax_to_scale(b_amax)],
-            scale_recipe_b=[F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
-            swizzle_a=[F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
-            swizzle_b=[F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
-            output_dtype=torch.bfloat16,
-        )
 
     class _FusedNvfp4Matmul(torch.autograd.Function):
         @staticmethod
@@ -415,6 +400,8 @@ def _install_fused_activation_quantizer() -> None:
             return dinput, dweight, dbias, None, None, None, None
 
     nv.nvfp4_matmul = _FusedNvfp4Matmul
+    if hasattr(nv, 'nvfp4_mm_triton'):
+        nv.nvfp4_mm_triton = _FusedNvfp4Matmul
     nv._nanochat_fused_activation = True
 
 
@@ -585,9 +572,20 @@ def convert_to_nvfp4_training(
     _install_fast_weight_quantizer()
     if not use_rht:
         _use_plain_quantization()
-    if os.environ.get("NANOCHAT_NVFP4_FUSED_QUANT", "0") == "1":
+    fused_flags = (
+        "NANOCHAT_NVFP4_FUSED_QUANT",
+        "NANOCHAT_NVFP4_FUSED_RMSNORM",
+        "NANOCHAT_NVFP4_FUSED_MLP",
+    )
+    if any(os.environ.get(key, "0") == "1" for key in fused_flags):
         if use_rht:
-            raise ValueError("fused activation quantizer currently supports plain mode only")
+            raise ValueError("SM121 fused kernels currently support plain quantization only; "
+                             "RHT fusion needs its own rotated-value amax algorithm")
+        # Dynamic CUDA compilation and a warm launch must complete before the
+        # training graph is captured, even if only norm/MLP fusion was selected.
+        from nanochat.kernels.fused_quant import prewarm
+        prewarm()
+    if os.environ.get("NANOCHAT_NVFP4_FUSED_QUANT", "0") == "1":
         _install_fused_activation_quantizer()
     # The cached quantizer returns clones of the packed weights (see
     # ``_cached_impl``), so Inductor owns every tensor it may donate.
