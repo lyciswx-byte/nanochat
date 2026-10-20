@@ -120,6 +120,76 @@ _wq_cache: dict = {}
 _wq_stats = {"hit": 0, "miss": 0}
 
 
+class _NVFP4ShadowCast(torch.autograd.Function):
+    """Use a step-stable BF16 copy in forward, but return gradients to FP32 master."""
+
+    @staticmethod
+    def forward(ctx, master: torch.Tensor, shadow: torch.Tensor):
+        ctx.master_dtype = master.dtype
+        return shadow
+
+    @staticmethod
+    def backward(ctx, grad_shadow: torch.Tensor):
+        # Equivalent to the backward of master.to(torch.bfloat16).
+        return grad_shadow.to(ctx.master_dtype), None
+
+
+def _install_weight_shadow_forward():
+    """Avoid recasting each FP32 master weight during every microstep.
+
+    torchao casts the weight to BF16 *inside* its autograd Function before
+    _weight_quantize_2d sees it. That temporary has a new address/version on
+    each compiled invocation, defeating the quantization cache. A nonpersistent
+    BF16 buffer gives torchao a stable input and still routes the gradient to
+    the original FP32 optimizer parameter.
+    """
+    if getattr(NVFP4Linear, "_nanochat_shadow_forward_patched", False):
+        return
+
+    original_forward = NVFP4Linear.forward
+
+    def forward(self, x):
+        shadow = getattr(self, "_nanochat_bf16_weight", None)
+        if shadow is None or self.process_group is not None:
+            return original_forward(self, x)
+        from torchao.prototype.moe_training.nvfp4_training.nvfp4_linear import (
+            nvfp4_linear,
+        )
+        return nvfp4_linear(
+            x,
+            _NVFP4ShadowCast.apply(self.weight, shadow),
+            self.bias,
+            kernel_preference=self.kernel_preference,
+            sr_seed=self._sr_seed,
+            sign_vector=self.rht_sign_vector,
+            use_fast_math=self.use_fast_math,
+        )
+
+    NVFP4Linear.forward = forward
+    NVFP4Linear._nanochat_shadow_forward_patched = True
+
+
+@torch.no_grad()
+def refresh_nvfp4_weight_shadows(model: nn.Module):
+    """Refresh BF16 copies once *after* each optimizer update, outside compile.
+
+    All module-local shadows have stable storage across compiled calls.
+    Copying is on the current CUDA stream, so the next forward observes the
+    updated weight without an extra host sync. Buffers are nonpersistent.
+    """
+    for module in model.modules():
+        if isinstance(module, NVFP4Linear):
+            shadow = getattr(module, "_nanochat_bf16_weight", None)
+            if shadow is not None:
+                shadow.copy_(module.weight)
+
+
+def get_weight_cache_stats() -> dict:
+    """Cumulative runtime op invocations (CUDA graph replay must stay disabled)."""
+    return dict(_wq_stats)
+
+
+
 def _install_weight_quant_cache():
     """Reuse the quantized weight across gradient-accumulation micro-steps.
 
@@ -139,7 +209,10 @@ def _install_weight_quant_cache():
         # torch.compile hands us functionalized views of the parameter, so the
         # Python object identity changes every call; the storage pointer and
         # the version counter do not.
-        key = (x.data_ptr(), x._version, tuple(x.shape))
+        # A stable BF16 module buffer (when enabled) survives functionalized
+        # views, while optimizer-step refresh bumps its version. Include the
+        # backend and dtype to avoid cross-recipe/cross-layout reuse.
+        key = (x.data_ptr(), x._version, tuple(x.shape), x.dtype, x.device, use_cutedsl)
         hit = _wq_cache.get(key)
         if hit is not None:
             _wq_stats["hit"] += 1
@@ -408,6 +481,9 @@ def convert_to_nvfp4_training(
     if not use_rht:
         _use_plain_quantization()
     _install_weight_quant_cache()
+    shadow_enabled = os.environ.get("NANOCHAT_NVFP4_WEIGHT_SHADOW", "1") == "1"
+    if shadow_enabled:
+        _install_weight_shadow_forward()
     if os.environ.get("NANOCHAT_NVFP4_FAST_ACCUM", "0") == "1":
         _install_fast_accum_scaled_mm()
     if os.environ.get("NANOCHAT_NVFP4_GEMM", "torchao").lower() == "quack":
@@ -452,6 +528,14 @@ def convert_to_nvfp4_training(
     n = 0
     for mod in model.modules():
         if isinstance(mod, NVFP4Linear):
+            if shadow_enabled and mod.process_group is None and mod.weight.dtype != torch.bfloat16:
+                # No new parameter or persistent state_dict entry. The trainer
+                # fills this immediately, before warmup / torch.compile.
+                mod.register_buffer(
+                    "_nanochat_bf16_weight",
+                    torch.empty_like(mod.weight, dtype=torch.bfloat16),
+                    persistent=False,
+                )
             # Keep checkpoints byte-compatible with a plain GPT state_dict:
             # the RHT seed/basis are run-local, not model weights.
             mod._non_persistent_buffers_set.update({"_sr_seed", "_rht_sign_vector"})

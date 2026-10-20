@@ -102,6 +102,15 @@ if device_type == "cuda":
     if _compile_threads < 1:
         raise ValueError("NANOCHAT_COMPILE_THREADS must be >= 1")
     _inductor_config.compile_threads = _compile_threads
+    if args.nvfp4 and os.environ.get("NANOCHAT_NVFP4_WEIGHT_SHADOW", "1") == "1":
+        # Inductor CUDA graphs capture the *quantization kernels* themselves.
+        # Python custom-op caching only executes at capture, not at replay, and
+        # would then replay stale packed tensors after optimizer.step(). Keep
+        # the compiled kernels but explicitly turn off CUDA-graph replay for
+        # the epoch-scoped weight cache. Re-enable only after a graph-safe
+        # device-side cache/invalidation implementation exists.
+        _inductor_config.triton.cudagraphs = False
+        print0("NVFP4 weight shadow/cache: CUDA-graph replay disabled")
     # Triton/C++ helper builds can fan out independently of Inductor's Python
     # pool. Keep that second layer bounded when the trainer is launched
     # directly instead of through the Spark bundle wrapper.
@@ -225,6 +234,8 @@ if args.nvfp4:
             print0(f"✓ Fused QKV projections in {num_fused_qkv} attention layers")
         num_linear = sum(1 for m in model.modules() if isinstance(m, torch.nn.Linear))
         num_nvfp4 = convert_to_nvfp4_training(model, use_rht=args.nvfp4_rht)
+        from nanochat.nvfp4 import refresh_nvfp4_weight_shadows
+        refresh_nvfp4_weight_shadows(model)  # initialize before compile/warmup
         print0(f"✓ NVFP4 training enabled (sm_121a, RTNE backward, RHT={args.nvfp4_rht}) - converted {num_nvfp4}/{num_linear} linear layers")
 
 # Context manager to temporarily disable low-precision Linears so that model
@@ -613,8 +624,9 @@ while True:
         clear_fp8_weight_cache()
     if args.nvfp4:
         # Weights changed in optimizer.step(); drop the cached NVFP4 weights.
-        from nanochat.nvfp4 import invalidate_weight_cache
+        from nanochat.nvfp4 import invalidate_weight_cache, refresh_nvfp4_weight_shadows
         invalidate_weight_cache()
+        refresh_nvfp4_weight_shadows(orig_model)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()
     t1 = time.time()
@@ -642,6 +654,10 @@ while True:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    if args.nvfp4 and step % 100 == 0:
+        from nanochat.nvfp4 import get_weight_cache_stats
+        cache_stats = get_weight_cache_stats()
+        print0(f"NVFP4 weight-cache runtime hit/miss: {cache_stats['hit']}/{cache_stats['miss']}")
     if step % 100 == 0:
         log_data = {
             "step": step,
