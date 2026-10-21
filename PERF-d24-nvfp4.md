@@ -195,3 +195,20 @@ Expert consult (ChatGPT, 2026-10-21) conclusion: 30k requires ~92 TFLOPS
 sustained across all GEMMs *and* a ~2x cut in non-GEMM time; realistic planning
 range 24-26k. Next lever: RMSNorm/residual (0.40 s), then attention (0.31) and
 ReLU^2 (0.24).
+
+## Triton RMSNorm backward (expert-recommended experiment): NO-GO
+
+Implemented a 4-row-per-CTA Triton RMSNorm forward/backward pair
+(`nanochat/kernels/rmsnorm_triton.py`, `NANOCHAT_TRITON_RMSNORM=1`), FP32
+accumulation, 2048-wide masked tile, no extra launches.
+
+| config | micro-step |
+|---|---|
+| selective cuBLAS (current best) | 2.775 s |
+| + Triton RMSNorm | **2.863 s (+88 ms)** |
+
+GO/NO-GO threshold was <=2.735 s (>=40 ms saving). Rejected: the opaque norm
+op breaks Inductor's residual-add/norm fusion, costing more than the retiled
+backward saves, and the gradient differs from `F.rms_norm` by ~0.39% mean
+relative error (BF16 rounding differences). Code kept behind the env flag,
+default off.

@@ -41,6 +41,9 @@ class GPTConfig:
 
 
 def norm(x):
+    if os.environ.get("NANOCHAT_TRITON_RMSNORM", "0") == "1":
+        from nanochat.kernels.rmsnorm_triton import rmsnorm
+        return rmsnorm(x)
     return F.rms_norm(x, (x.size(-1),)) # note that this will run in bf16, seems ok
 
 class Linear(nn.Linear):
