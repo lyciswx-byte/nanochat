@@ -212,3 +212,26 @@ op breaks Inductor's residual-add/norm fusion, costing more than the retiled
 backward saves, and the gradient differs from `F.rms_norm` by ~0.39% mean
 relative error (BF16 rounding differences). Code kept behind the env flag,
 default off.
+
+## cuBLASLt ReLU epilogue for the MLP up-projection: neutral
+
+Measured operator-level: cuBLASLt with `CUBLASLT_EPILOGUE_RELU` computes
+relu(x @ w^T) bit-exactly at **90 TFLOPS** (32768x1536x6144), versus the sm80
+CUTLASS relu-epilogue kernel group that Inductor emits. Replacing only the MLP
+forward with the Lt op and keeping the square + backward unchanged:
+
+| config | step (repeat) |
+|---|---|
+| selective cuBLAS baseline | 2.775 / 2.809 s |
+| + cuBLASLt RELU MLP | 2.805 s |
+
+Neutral. The run-to-run spread of the baseline is ~35 ms, so the Lt epilogue
+does not produce a measurable end-to-end gain; the fused sm80 kernel group was
+already close to the achieved rate in situ.
+
+Operator-level GEMM tuning summary (cublasGemmAlgo_t sweep, 30 runs, 2.4 GHz):
+c_fc 94.7, dgrad 92.1, mlp c_proj 91.9, lm_head 93.3, wgrad 89.9, qkv 85.8.
+Model aggregate with selective cuBLAS: 165.7 TFLOP / 1.94 s = **85.2 TFLOPS**.
+The 92 TFLOPS threshold is reachable per operator but not yet sustained across
+the compiled graph; closing it needs a fused sm_121 relu^2 GEMM, not a swap to
+cuBLASLt.
