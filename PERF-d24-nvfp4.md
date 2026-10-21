@@ -171,3 +171,27 @@ End-to-end it is **neutral**: 3.142 s vs 3.141 s for the d24 BF16 step
 the relu epilogue into the MLP GEMMs). The standalone 89 vs 77 TFLOP/s gap does
 not translate to the compiled model, so the BF16 GEMM share is already at the
 achieved rate and this route cannot close the 30k gap.
+
+## Selective cuBLAS dispatch (expert-recommended experiment)
+
+Applying the cuBLAS op to every Linear destroyed Inductor's relu epilogue and
+was neutral. Keeping the MLP up-projection (`c_fc`, the only relu-fused site)
+on `F.linear` and routing qkv / attn c_proj / mlp c_proj / lm_head through the
+op is a clear win:
+
+| Metric | baseline | selective cuBLAS |
+|---|---|---|
+| micro-step | 3.141 s | **2.775 s** (-11.6%) |
+| forward | 1019 ms | 897 ms |
+| backward | 2107 ms | 1878 ms |
+| trainer tok/s/GPU | 10.13k | **11.33k** |
+| dual-node (trainer) | 20.2k | **22.7k** |
+| peak allocation | 46.7 GiB | 53.0 GiB |
+| loss, 4 steps | 10.397344/10.371974/10.322719/10.252465 | identical |
+
+Enable with `NANOCHAT_CUBLAS_LINEAR=1 NANOCHAT_MASTER_BF16=1`.
+
+Expert consult (ChatGPT, 2026-10-21) conclusion: 30k requires ~92 TFLOPS
+sustained across all GEMMs *and* a ~2x cut in non-GEMM time; realistic planning
+range 24-26k. Next lever: RMSNorm/residual (0.40 s), then attention (0.31) and
+ReLU^2 (0.24).
