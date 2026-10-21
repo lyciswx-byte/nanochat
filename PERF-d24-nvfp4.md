@@ -235,3 +235,26 @@ Model aggregate with selective cuBLAS: 165.7 TFLOP / 1.94 s = **85.2 TFLOPS**.
 The 92 TFLOPS threshold is reachable per operator but not yet sustained across
 the compiled graph; closing it needs a fused sm_121 relu^2 GEMM, not a swap to
 cuBLASLt.
+
+## Custom CUTLASS sm_121 relu^2 epilogue kernel: correct but not competitive
+
+`nanochat/kernels/csrc/relu2_gemm.cu` implements C = relu(A @ B^T)^2 with a
+CUTLASS 2.x Sm80 tensorop GEMM (128x128x32, 64x64x32 warp, 3 stages) and a
+`LinearCombinationGeneric<ReluSquare, ...>` epilogue. It compiles for sm_121a
+and is numerically correct (small-case max abs error 5e-4 versus torch).
+
+Throughput versus M (K=1536, N=6144):
+
+| M | ms | TFLOPS |
+|---|---|---|
+| 2048 | 0.39 | 98 |
+| 4096 | 0.75 | 104 |
+| 8192 | 4.27 | 36 |
+| 16384 | 13.72 | 23 |
+| 32768 | 27.03 | 23 |
+
+There is a 4x collapse between M=4096 and M=8192 that is not thermal (cuBLAS
+sustains ~89 at M=32768 on the same machine). Switching to
+`GemmHorizontalThreadblockSwizzle` failed to compile. Making this competitive
+needs proper tile/swizzle/stage tuning and profiling, with an end-to-end upside
+of only ~0.1-0.2 s. Not integrated.
