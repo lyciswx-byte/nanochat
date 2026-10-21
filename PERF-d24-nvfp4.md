@@ -258,3 +258,19 @@ sustains ~89 at M=32768 on the same machine). Switching to
 `GemmHorizontalThreadblockSwizzle` failed to compile. Making this competitive
 needs proper tile/swizzle/stage tuning and profiling, with an end-to-end upside
 of only ~0.1-0.2 s. Not integrated.
+
+### Chunking recovers the relu^2 GEMM throughput
+
+The M-scaling collapse is an L2-reuse problem: the identity threadblock order
+streams the whole A matrix once per N tile (48 x 100 MB at M=32768). Calling
+the same kernel on M chunks that fit L2 fixes it:
+
+| execution | ms (M=32768,K=1536,N=6144) | TFLOPS |
+|---|---|---|
+| one call | 29.32 | 21 |
+| 16 chunks of M=2048 | **7.23** | **86** |
+| 8 chunks of M=4096 | 8.25 | 75 |
+
+So a chunked CUTLASS relu^2 GEMM reaches cuBLAS-class throughput (86) and also
+removes the separate square pass (~0.09 s per step). End-to-end upside is
+roughly 0.1 s (2.80 -> ~2.70), so it is not yet wired into the model.

@@ -9,6 +9,7 @@
 
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/device/gemm.h"
+#include "cutlass/gemm/threadblock/threadblock_swizzle.h"
 #include "cutlass/epilogue/thread/linear_combination_generic.h"
 
 namespace {
