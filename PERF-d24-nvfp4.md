@@ -274,3 +274,11 @@ the same kernel on M chunks that fit L2 fixes it:
 So a chunked CUTLASS relu^2 GEMM reaches cuBLAS-class throughput (86) and also
 removes the separate square pass (~0.09 s per step). End-to-end upside is
 roughly 0.1 s (2.80 -> ~2.70), so it is not yet wired into the model.
+
+### Integrating the chunked relu^2 GEMM: NO-GO
+
+Wiring the chunked CUTLASS relu^2 op into the MLP (`NANOCHAT_RELU2_GEMM=1`)
+gives **3.036 s vs 2.805 s** baseline. The op's internal 16-way M chunking plus
+`torch.cat` of the 16 parts (a 400 MB copy per site) and the lost Inductor
+fusion cost more than the kernel saves. Peak allocation drops to 44 GiB, but the
+step is slower. Not integrated; the kernel stays experimental.
